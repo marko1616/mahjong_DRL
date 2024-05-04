@@ -100,7 +100,6 @@ class MahjongEnv(gym.Env):
         # [TODO] 增加下面两个宝牌划分和上面分牌划分的三人支持
         # 重置游戏环境。如果is_three为True，则游戏为三人麻将，否则为四人麻将。
         # 初始化剩余牌堆，包含9种每种4张的“万、饼、索”（man, pin, sou），以及7种每种4张的字牌（1-7z）
-        self.is_first_round = True
         self.done: bool = False
         self.pending_done: bool = False  # 多人同时胡牌的等待flag
         self.seat_now: int = 0  # 0-3
@@ -128,7 +127,7 @@ class MahjongEnv(gym.Env):
         self.kang_count = 0  # 如果四次杠要流局除非能和
 
         self.status = {"richi": False,
-                       "shocking": False, "has_open_tanyao": False, "last_shanten": 6, "last_get_tile": ""}
+                       "shocking": False, "has_open_tanyao": False, "last_shanten": 6, "last_get_tile": "", "first_round": True}
         # 根据游戏是三人还是四人，复制初始化的手牌结构
         self.hand_tiles = [deepcopy(self.hand_tiles) for _ in range(3)] if is_three else [
             deepcopy(self.hand_tiles) for _ in range(4)]
@@ -293,9 +292,6 @@ class MahjongEnv(gym.Env):
         reward = 0
         claiming = False
         action_mask = [0]*46
-        # print(self.hand_tiles)
-        # print(action)
-        # print(f"player:{self.seat_now}")
 
         # 鸣牌&特殊动作处理
         claiming_event = self._get_first_claiming_event()
@@ -336,9 +332,16 @@ class MahjongEnv(gym.Env):
 
         # 处理打牌
         if action < 35 and not start:
+            # 计算本次摸入的牌有无导致向听数减小
+            shanten = self.shanten_calculator.calculate_shanten(self._get_hand_34_array(self.seat_now))
+            if shanten != self.status[self.seat_now]["last_shanten"]:
+                if not self.status[self.seat_now]["first_round"]:
+                    reward += self.status[self.seat_now]["last_shanten"] - shanten
+            self.status[self.seat_now]["last_shanten"] = shanten
+            self.status[self.seat_now]["first_round"] = False
+            
             self.claiming_from = self.seat_now
-            self._delta_bucket(
-                self.hand_tiles[self.seat_now], self._34_to_str(action), gain=-1)
+            self._delta_bucket(self.hand_tiles[self.seat_now], self._34_to_str(action), gain=-1)
             # 添加鸣牌列表
             for player_index in range(3):
                 if player_index == self.seat_now:
@@ -430,8 +433,6 @@ class MahjongEnv(gym.Env):
                 self.seat_now += 1
             if self.seat_now == 4:
                 self.seat_now = 0
-                # 这逻辑铁有问题就是懒得改
-                self.is_first_round = False
 
             get_tile = self.remain_tiles.pop(0)
             self._delta_bucket(
@@ -463,9 +464,6 @@ class MahjongEnv(gym.Env):
                 self.pending_claiming["richi"].append([self.seat_now, 43, [self._get_hand_34_array(self.seat_now), get_tile]])
                 action_mask = self._add_action_list(action_mask, temp_list)
             elif self.status[self.seat_now]["last_shanten"] != shanten:
-                # 向听数减少给奖励(第一轮不算)
-                if not self.is_first_round:
-                    reward += self.status[self.seat_now]["last_shanten"] - shanten
                 self.status[self.seat_now]["last_shanten"] = shanten
                 action_mask = self._add_action_list(action_mask, self._get_discard_mask(self.seat_now))
             else:
@@ -515,6 +513,7 @@ if __name__ == "__main__":
         time_s = time.time()
         status, reward, done, info = obj.step(random_one_index(info["action_mask"]))
         time_list.append(time.time()-time_s)
+        print(reward,end=" ")
         # print(status["actions"])
         if done:
             print(f"DONE #{seed}\nStep Time: {1/(sum(time_list)/len(time_list))} steps/second")

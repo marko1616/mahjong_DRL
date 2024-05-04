@@ -44,6 +44,7 @@ DROPOUT = 0.1
 NHEAD = 12
 
 # 计算参数&保存参数&显示参数
+VERBOSE_POSITIVE_DONE_REWARD = True
 NDISPLAY = 5
 LOG_DIR = f"runs/{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
 DEVICE = "cuda"
@@ -160,6 +161,8 @@ class Agent:
             state_values = state_values.squeeze(1)
             batch_log_policy = []
             for index, logits in enumerate(batch_logits):
+                if is_terminals[index]:
+                    break
                 logits = logits.squeeze(0)
                 logits = logits[:-35]# 去除牌型token和[PAD]
                 logits = logits.masked_fill(~tensor([True if item else False for item in info[index]["action_mask"]],device=DEVICE),float('-inf'))# 去除无法使用的动作
@@ -169,13 +172,12 @@ class Agent:
             batch_log_policy = tensor(batch_log_policy,device=DEVICE,dtype=DTYPE)
             advantages = self._get_GAEs(tensor(rewards,device=DEVICE,dtype=DTYPE), state_values.detach())
             # 策略比例
-            ratios = torch.exp(logprobs - batch_log_policy)
-            #print(rewards)
+            ratios = torch.exp(logprobs[:-1] - batch_log_policy)
 
             # PPO策略损失
-            surr1 = ratios*advantages
+            surr1 = ratios*advantages[:-1]
             # 策略裁剪
-            surr2 = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * advantages
+            surr2 = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip) * advantages[:-1]
             loss_policy = -torch.min(surr1, surr2)
             
             # 价值损失
@@ -218,16 +220,20 @@ class Agent:
             input_ids = input_ids.unsqueeze(0)# 添加batch
             
             # 添加轨迹
+            memories[player_index].states.append(self._pad_list_to_length(state))
+            memories[player_index].rewards.append(reward)
+            memories[player_index].is_terminals.append(done)
+            memories[player_index].info.append(info)
             if done:
+                # 方便截断的填充
+                memories[player_index].action_logprobs.append(0)
+                memories[player_index].actions.append(0)
+                if VERBOSE_POSITIVE_DONE_REWARD and reward:
+                    print(f"终局回报{reward}")
                 # 为所有人添加终端状态
                 for index, memory in enumerate(memories):
                     memory.is_terminals[-1] = True
                 break
-            else:
-                memories[player_index].states.append(self._pad_list_to_length(state))
-                memories[player_index].rewards.append(reward)
-                memories[player_index].is_terminals.append(done)
-                memories[player_index].info.append(info)
             
             # 计算策略
             logits, value = self.model_old(input_ids)
