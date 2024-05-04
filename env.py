@@ -358,39 +358,40 @@ class MahjongEnv(gym.Env):
                         # 存在役等乱七八糟的error
                         self.pending_claiming["ron"].append(
                             [player_index, 44, result])
-                if action <= 27 and (player_index - 1 == self.seat_now or (player_index == 0 and self.seat_now == 3)):# 不能吃字牌和只能吃上家
-                    # 上吃
-                    if action+2 <= 27:
-                        if (self._get_hand_34_array(player_index)[action-1+1] > 0 and self._get_hand_34_array(player_index)[action-1+2] > 0 and
-                            int((action) / 9) == int((action+1) / 9) == int((action+2) / 9)
-                            ):
-                            self.pending_claiming["chi"].append(
-                                [player_index, 35, action-1])
-                    # 中吃
-                    if action+1 <= 27 and action-1 > 0:
-                        if (self._get_hand_34_array(player_index)[action-1-1] > 0 and self._get_hand_34_array(player_index)[action-1+1] > 0 and
-                            int((action) / 9) == int((action-1) / 9) == int((action+1) / 9) and
-                            action - 1 > 0
-                            ):
-                            self.pending_claiming["chi"].append(
-                                [player_index, 36, action-1])
-                    # 下吃
-                    if action-2 > 0:
-                        if (self._get_hand_34_array(player_index)[action-1-1] > 0 and self._get_hand_34_array(player_index)[action-1-2] > 0 and
-                            int((action) / 9) == int((action-1) / 9) == int((action-2) / 9) and
-                            action - 1 > 0 and
-                            action - 2 > 0
-                            ):
-                            self.pending_claiming["chi"].append(
-                                [player_index, 37, action-1])
-                # 碰
-                if (self._get_hand_34_array(player_index)[action-1] >= 2):
-                    self.pending_claiming["pong"].append(
-                        [player_index, 38, action-1])
-                # 明杠
-                if (self._get_hand_34_array(player_index)[action-1] == 3):
-                    self.pending_claiming["pong"].append(
-                        [player_index, 39, action-1])
+                if not self.status[player_index]["richi"]:
+                    if action <= 27 and (player_index - 1 == self.seat_now or (player_index == 0 and self.seat_now == 3)):# 不能吃字牌和只能吃上家
+                        # 上吃
+                        if action+2 <= 27:
+                            if (self._get_hand_34_array(player_index)[action-1+1] > 0 and self._get_hand_34_array(player_index)[action-1+2] > 0 and
+                                int((action) / 9) == int((action+1) / 9) == int((action+2) / 9)
+                                ):
+                                self.pending_claiming["chi"].append(
+                                    [player_index, 35, action-1])
+                        # 中吃
+                        if action+1 <= 27 and action-1 > 0:
+                            if (self._get_hand_34_array(player_index)[action-1-1] > 0 and self._get_hand_34_array(player_index)[action-1+1] > 0 and
+                                int((action) / 9) == int((action-1) / 9) == int((action+1) / 9) and
+                                action - 1 > 0
+                                ):
+                                self.pending_claiming["chi"].append(
+                                    [player_index, 36, action-1])
+                        # 下吃
+                        if action-2 > 0:
+                            if (self._get_hand_34_array(player_index)[action-1-1] > 0 and self._get_hand_34_array(player_index)[action-1-2] > 0 and
+                                int((action) / 9) == int((action-1) / 9) == int((action-2) / 9) and
+                                action - 1 > 0 and
+                                action - 2 > 0
+                                ):
+                                self.pending_claiming["chi"].append(
+                                    [player_index, 37, action-1])
+                    # 碰
+                    if (self._get_hand_34_array(player_index)[action-1] >= 2):
+                        self.pending_claiming["pong"].append(
+                            [player_index, 38, action-1])
+                    # 明杠
+                    if (self._get_hand_34_array(player_index)[action-1] == 3):
+                        self.pending_claiming["pong"].append(
+                            [player_index, 39, action-1])
 
         # 开始对下回合进行计算
         last_claiming_event = claiming_event
