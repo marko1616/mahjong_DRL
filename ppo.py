@@ -1,4 +1,6 @@
+import os
 import random
+import datetime
 from dataclasses import dataclass, field
 from typing import Callable
 
@@ -9,22 +11,25 @@ from collections import deque
 
 import torch
 from torch.nn.functional import softmax
+from torch.utils.tensorboard import SummaryWriter
 from torch import tensor
 from torch import optim
 from torch import nn
 
+now = datetime.datetime.now()
+
 # 训练超参数
 MEMGET_NUM_PER_UPDATE = 500
 REPLAY_BUFFER_SIZE = 10000
-EPOCHES_PER_UPDATE = 2
+EPOCHES_PER_UPDATE = 10
 ACTION_EPSILION = 0.1
-CLIP_EPSILION = 0.2
+CLIP_EPSILION = 1
 WEIGHT_POLICY = 1
 WEIGHT_VALUE = 1.2
-BATCH_SIZE = 16
+BATCH_SIZE = 100
 EPISODES = 100000
 GAMMA = 1
-LAMBD = 0.95
+LAMBD = 0.45
 LR = 5e-5
 
 # 模型超参数
@@ -40,6 +45,7 @@ NHEAD = 12
 
 # 计算参数&保存参数&显示参数
 NDISPLAY = 5
+LOG_DIR = f"runs/{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
 DEVICE = "cuda"
 DTYPE = torch.float
 PATH = "./mahjong.pt"
@@ -76,7 +82,8 @@ class Agent:
         self.weight_value = weight_value
         
         self.model = GPTModelWithValue(VOCAB_SIZE,D_MODEL,NHEAD,NUM_DECODER_LAYERS,DIM_FEEDFORWARD,DIM_VALUE_MLP,DROPOUT)
-        self.model.load_state_dict(torch.load(PATH))
+        if os.path.exists(PATH):
+            self.model.load_state_dict(torch.load(PATH))
         
         self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
         self.model_old = GPTModelWithValue(VOCAB_SIZE,D_MODEL,NHEAD,NUM_DECODER_LAYERS,DIM_FEEDFORWARD,DIM_VALUE_MLP,DROPOUT)
@@ -131,9 +138,10 @@ class Agent:
     def _pad_list_to_length(self, lst, target_length=MAX_SEQ_LEN, pad_token_id=PAD_TOKEN_ID) -> list:
         return lst + [pad_token_id] * (target_length - len(lst))
 
-    def update(self, memory: Trail) -> None:
+    def update(self, memory: Trail, call_back:Callable|None=None) -> None:
         rewards = memory.rewards
         actions = memory.actions
+        is_terminals = memory.is_terminals
         info = memory.info
         logprobs = tensor(memory.action_logprobs,device=DEVICE,dtype=DTYPE)
         
@@ -175,9 +183,11 @@ class Agent:
             
             loss = self.weight_policy * loss_policy + self.weight_value * loss_value
             
-            # 优化
+            # 优化&记录
             self.optimizer.zero_grad()
             loss.mean().backward()
+            if not call_back is None:
+                call_back(loss.mean().item())
             self.optimizer.step()
         
         self.loss = loss.mean().item()
@@ -188,9 +198,9 @@ class Agent:
         done = False
         round = 0
         # 鉴于有四个智能体我们一次收集四分经验
-        memories = [Trail()]*4
+        memories = [Trail() for _ in range(4)]
         state, reward, done, info = self.env.reset()
-        while not done:
+        while True:
             action_mask = info["action_mask"]
             player_index = state["seat"]
             history = state["tokens"]
@@ -207,6 +217,18 @@ class Agent:
             state = input_ids.tolist()
             input_ids = input_ids.unsqueeze(0)# 添加batch
             
+            # 添加轨迹
+            if done:
+                # 为所有人添加终端状态
+                for index, memory in enumerate(memories):
+                    memory.is_terminals[-1] = True
+                break
+            else:
+                memories[player_index].states.append(self._pad_list_to_length(state))
+                memories[player_index].rewards.append(reward)
+                memories[player_index].is_terminals.append(done)
+                memories[player_index].info.append(info)
+            
             # 计算策略
             logits, value = self.model_old(input_ids)
             # 压缩batch
@@ -222,19 +244,15 @@ class Agent:
             else:
                 action = self._random_one_index(action_mask)
             
-            # 添加轨迹
-            memories[player_index].states.append(self._pad_list_to_length(state))
-            memories[player_index].rewards.append(reward)
-            memories[player_index].is_terminals.append(done)
-            memories[player_index].info.append(info)
             memories[player_index].actions.append(action)
             memories[player_index].action_logprobs.append(policy[action].item())
                 
             state, reward, done, info = self.env.step(action)
             round += 1
             
-            if not call_back is None:
-                call_back(reward)
+        if not call_back is None:
+            for memory in memories:
+                call_back(memory.rewards)
         
         for memory in memories:
             self.replay_buffer.add(memory)
@@ -242,20 +260,43 @@ class Agent:
 class Display:
     def __init__(self) -> None:
         self.rewards = []
+        self.trail_rewards = []
+        self.losses = []
         
         self.avr_reward = 0
         self.max_reward = 0
-    def update(self, reward:int) -> None:
-        self.rewards.append(reward)
+        self.avr_reward_per_trail = 0
+        self.max_reward_per_trail = 0
+        
+        self.step = 0
+        self.writer = SummaryWriter(LOG_DIR)
+    def reward_update(self, reward_trail: list[int]) -> None:
+        for reward in reward_trail:
+            self.rewards.append(reward)
+        self.trail_rewards.append(sum(reward_trail))
         
         self.avr_reward = sum(self.rewards)/len(self.rewards)
         self.max_reward = max(self.rewards)
+        self.avr_reward_per_trail = sum(self.trail_rewards)/len(self.trail_rewards)
+        self.max_reward_per_trail = max(self.trail_rewards)
+    
+    def loss_update(self, loss:float) -> None:
+        self.losses.append(loss)
     
     def reset(self) -> None:
+        self.writer.add_scalar('Loss/train', sum(self.losses)/len(self.losses), self.step)
+        self.writer.add_scalar('AVR Reward', self.avr_reward, self.step)
+        self.writer.add_scalar('AVR Trail Reward', self.avr_reward_per_trail, self.step)
+        self.step += 1
+        
         self.rewards = []
+        self.trail_rewards = []
+        self.losses = []
         
         self.avr_reward = 0
         self.max_reward = 0
+        self.avr_reward_per_trail = 0
+        self.max_reward_per_trail = 0
              
 if __name__ == "__main__":
     from rich import print
@@ -265,11 +306,11 @@ if __name__ == "__main__":
     display = Display()
     for episode in range(EPISODES):
         for index in range(MEMGET_NUM_PER_UPDATE):
-            agent.get_memory(display.update)
+            agent.get_memory(display.reward_update)
             if (index+1) % int(MEMGET_NUM_PER_UPDATE/NDISPLAY) == 0:
-                print(f"完成第{episode+1}轮{index+1}次轨迹收集。平均奖励:{display.avr_reward:.4f}。最大奖励:{display.max_reward:.4f}")
+                print(f"完成第{episode+1}轮{index+1}次轨迹收集\n平均奖励:{display.avr_reward:.4f}\n最大奖励:{display.max_reward:.4f}\n轨迹平均:{display.avr_reward_per_trail:.4f}\n轨迹最大:{display.max_reward_per_trail:.4f}")
         for index, memory in enumerate(agent.replay_buffer.sample(BATCH_SIZE)):
-            agent.update(memory)
+            agent.update(memory,display.loss_update)
             if (index+1) % int(BATCH_SIZE/NDISPLAY) == 0:
                 print(f"完成第{episode+1}轮{index+1}次权重更新\nLoss:{agent.loss}")
             torch.save(agent.model.state_dict(), PATH)
