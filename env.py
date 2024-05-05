@@ -284,6 +284,20 @@ class MahjongEnv(gym.Env):
         list_34[hai_index-1] = 1
         return list_34
 
+    def _get_dora(self,end:bool=False,richi:bool=False,return_34:bool=False) -> list[int]:
+        dora_str = []
+        for i in range(self.kang_count+1):
+            dora_str.append(self.dora_list[:5][i])
+        if end and richi:
+            for i in range(self.kang_count+1):
+                dora_str.append(self.dora_list[5:][i])
+        dora_list = [0]*34
+        for dora in dora_str:
+            dora_list[self._str_to_34(dora).index(1)] += 1
+        if return_34:
+            return dora_list
+        return TilesConverter.to_136_array(dora_list)
+
     def step(self, action: int, start: bool = False) -> tuple[dict, int, bool, list]:
         if not start:
             self.history_tokens.append(action)
@@ -355,6 +369,7 @@ class MahjongEnv(gym.Env):
                     result = self.score_calculator.estimate_hand_value(TilesConverter.to_136_array(temp_tiles),
                                                                 TilesConverter.to_136_array(self._hai_index_to_34(action))[0],
                                                                 melds=self.melds[player_index],
+                                                                dora_indicators=self._get_dora(end=True,richi=self.status[self.seat_now]["richi"]),
                                                                 config=HandConfig(is_riichi=self.status[self.seat_now]["richi"],
                                                                                     options=OptionalRules(self.status[self.seat_now]["has_open_tanyao"])))
                     if not result.error:
@@ -403,9 +418,7 @@ class MahjongEnv(gym.Env):
             # 如果所有人跳过则恢复正常顺序
             self.seat_now = self.claiming_from
 
-        if (self.pending_done and not self.pending_claiming["ron"]
-            or not self.remain_tiles
-            ) or (self.kang_count == 4 and not (self.pending_claiming["tsumo"] or self.pending_claiming["ron"])):
+        if (self.pending_done and not self.pending_claiming["ron"]) or (not self.remain_tiles) or (self.kang_count == 4 and not (self.pending_claiming["tsumo"] or self.pending_claiming["ron"])):
             self.done = True
         elif claiming_event:
             # 如果存在等待的鸣牌则继续
@@ -449,23 +462,21 @@ class MahjongEnv(gym.Env):
                 result = self.score_calculator.estimate_hand_value(TilesConverter.to_136_array(self._get_hand_34_array(self.seat_now)),
                                                 TilesConverter.to_136_array(self._str_to_34(get_tile))[0],
                                                 melds=self.melds[self.seat_now],
+                                                dora_indicators=self._get_dora(end=True,richi=self.status[self.seat_now]["richi"]),
                                                 config=HandConfig(is_riichi=self.status[self.seat_now]["richi"],
-                                                                    options=OptionalRules(self.status[self.seat_now]["has_open_tanyao"])))
+                                                                  options=OptionalRules(self.status[self.seat_now]["has_open_tanyao"])))
                 if not result.error:
                     self.pending_claiming["tsumo"].append([self.seat_now, 45, result])
                     action_mask = self._add_action_list(action_mask, temp_list)
                 else:
                     action_mask = self._add_action_list(action_mask, self._get_discard_mask(self.seat_now))
-            elif shanten == 0 and not self.melds[self.seat_now]:
+            elif shanten == 0 and not self.melds[self.seat_now] and not self.status[self.seat_now]["richi"]:
                 # 如果可以立直
                 temp_list = [0]*46
                 temp_list[42]=1
                 temp_list[45]=1
                 self.pending_claiming["richi"].append([self.seat_now, 43, [self._get_hand_34_array(self.seat_now), get_tile]])
                 action_mask = self._add_action_list(action_mask, temp_list)
-            elif self.status[self.seat_now]["last_shanten"] != shanten:
-                self.status[self.seat_now]["last_shanten"] = shanten
-                action_mask = self._add_action_list(action_mask, self._get_discard_mask(self.seat_now))
             else:
                 action_mask = self._add_action_list(action_mask, self._get_discard_mask(self.seat_now))
 
@@ -513,8 +524,8 @@ if __name__ == "__main__":
         time_s = time.time()
         status, reward, done, info = obj.step(random_one_index(info["action_mask"]))
         time_list.append(time.time()-time_s)
-        print(reward,end=" ")
         # print(status["actions"])
+        print(reward,end=" ")
         if done:
             print(f"DONE #{seed}\nStep Time: {1/(sum(time_list)/len(time_list))} steps/second")
             status, reward, done, info = obj.reset()
