@@ -1,5 +1,6 @@
 import os
 import sys
+import pickle
 import random
 import datetime
 from dataclasses import dataclass, field
@@ -20,42 +21,46 @@ from torch import nn
 now = datetime.datetime.now()
 
 # 训练超参数
-MEMGET_NUM_PER_UPDATE = 500
-REPLAY_BUFFER_SIZE = 10000
+MEMGET_NUM_PER_UPDATE = 400
+REPLAY_BUFFER_SIZE = 2500
 EPOCHES_PER_UPDATE = 10
 ACTION_EPSILION = 0.1
-CLIP_EPSILION = 1
+CLIP_EPSILION = 0.2
 WEIGHT_POLICY = 1
 WEIGHT_VALUE = 1.2
 BATCH_SIZE = 200
 EPISODES = 100000
 GAMMA = 1
-ALPHA = 0.2
+ALPHA = 0.25
 LAMBD = 0.45
-LR = 1e-5
+LR = 5e-5
 
 # 模型超参数
-NUM_DECODER_LAYERS = 3
-DIM_FEEDFORWARD = 1024
+NUM_DECODER_LAYERS = 4
+SEPARATION_LAYER= 2
+DIM_FEEDFORWARD = 2048
+ENABLE_COMPILE = False
 DIM_VALUE_MLP = 4096
 PAD_TOKEN_ID = 219
 MAX_SEQ_LEN = 512
 VOCAB_SIZE = 1 + 184 + 34 + 1# [SEP]，action，手牌，[PAD]
+MAX_NORM = 0.5
 D_MODEL = 1024# 内部feature维度
 DROPOUT = 0.1
 NHEAD = 8
 
 # 计算参数&保存参数&显示参数
 VERBOSE_POSITIVE_DONE_REWARD = True
-NDISPLAY = 5
+REPLAY_BUFFER_FILE = "replay.pkl"
+NDISPLAY = 4
 LOG_DIR = f"runs/{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
 DEVICE = "cuda"
-DTYPE = torch.bfloat16
+DTYPE = torch.float
 PATH = "./mahjong.pt"
 
 def generate_square_subsequent_mask(sz,device):
     mask = (torch.triu(torch.ones(sz, sz, device=device, dtype=DTYPE)) == 1).transpose(0, 1)
-    mask = mask.bfloat16().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
+    mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
     return mask
 
 @dataclass
@@ -65,7 +70,6 @@ class Trail:
     is_terminals: list = field(default_factory=list)
     info: list = field(default_factory=list)
     actions: list = field(default_factory=list)
-    action_logprobs:list = field(default_factory=list)
 
 class ReplayBuffer:
     def __init__(self) -> None:
@@ -90,27 +94,29 @@ class Agent:
         self.weight_value = weight_value
         self.alpha = alpha
         
-        self.model = GPTModelWithValue(VOCAB_SIZE,D_MODEL,NHEAD,NUM_DECODER_LAYERS,DIM_FEEDFORWARD,DIM_VALUE_MLP,DROPOUT)
+        self.model = GPTModelWithValue(VOCAB_SIZE,D_MODEL,NHEAD,NUM_DECODER_LAYERS,DIM_FEEDFORWARD,DROPOUT,SEPARATION_LAYER)
         if os.path.exists(PATH):
             self.model.load_state_dict(torch.load(PATH))
         
-        self.optimizer = optim.Adam(self.model.parameters(), lr=lr)
-        self.model_old = GPTModelWithValue(VOCAB_SIZE,D_MODEL,NHEAD,NUM_DECODER_LAYERS,DIM_FEEDFORWARD,DIM_VALUE_MLP,DROPOUT)
+        self.optimizer = optim.AdamW(self.model.parameters(), lr=lr)
+        self.model_old = GPTModelWithValue(VOCAB_SIZE,D_MODEL,NHEAD,NUM_DECODER_LAYERS,DIM_FEEDFORWARD,DROPOUT,SEPARATION_LAYER)
         self.model_old.load_state_dict(self.model.state_dict())
         self.mask = generate_square_subsequent_mask(MAX_SEQ_LEN,DEVICE)
         
         self.MseLoss = nn.MSELoss()
         
-        self.replay_buffer = ReplayBuffer() 
+        if os.path.exists(REPLAY_BUFFER_FILE):
+            with open(REPLAY_BUFFER_FILE,"rb") as file:
+                self.replay_buffer = pickle.load(file)
+        else:
+            self.replay_buffer = ReplayBuffer()
         self.env = MahjongEnv()
         
         self.model.to(DEVICE,DTYPE)
         self.model_old.to(DEVICE,DTYPE)
-        if sys.platform.startswith("linux"):
+        if sys.platform.startswith("linux") and ENABLE_COMPILE:
             self.model = torch.compile(self.model)
             self.model_old = torch.compile(self.model_old)
-        
-        self.loss = 0
     
     def _get_GAEs(self, rewards, values) -> tensor:
         # 计算delta：即时奖励加上折扣后的下一状态值函数，减去当前状态值函数
@@ -142,7 +148,7 @@ class Agent:
             e[t] += 1.0
             value_updates += self.alpha * deltas[t] * e
         
-        return (values + tensor(value_updates,dtype=DTYPE,device=DEVICE))[:-1]
+        return (values + value_updates)[:-1]
     
     def _random_one_index(self, multihot) -> int:
         # 找出所有值为1的索引
@@ -161,7 +167,6 @@ class Agent:
         actions = memory.actions
         is_terminals = memory.is_terminals
         info = memory.info
-        logprobs = tensor(memory.action_logprobs,device=DEVICE,dtype=DTYPE)
         
         # 获取需要的张量
         old_states = None
@@ -170,46 +175,65 @@ class Agent:
                 old_states = tensor(state,device=DEVICE).unsqueeze(0)
             else:
                 old_states = torch.cat((old_states,tensor(state,device=DEVICE).unsqueeze(0)),dim=0)
+                
+        # 获取当前在线模型的动作对数概率
+        logprobs = None
+        with torch.no_grad():
+            batch_logits, _ = self.model_old(old_states,self.mask)
+        for index, logits in enumerate(batch_logits):
+            if is_terminals[index]:
+                break
+            logits = logits.squeeze(0)
+            logits = logits[:-35]# 去除牌型token和[PAD]
+            policy = softmax(logits,0).log()
+            if logprobs is None:
+                logprobs = policy[actions[index]].unsqueeze(0)
+            else:
+                logprobs = torch.cat((logprobs,policy[actions[index]].unsqueeze(0)))
 
         # 优化
         for _ in range(self.K_epochs):
             # 获取目前模型的评估
             batch_logits, state_values = self.model(old_states,self.mask)
             state_values = state_values.squeeze(1)
-            batch_log_policy = []
+            
+            batch_log_policy = None
             for index, logits in enumerate(batch_logits):
                 if is_terminals[index]:
                     break
                 logits = logits.squeeze(0)
                 logits = logits[:-35]# 去除牌型token和[PAD]
-                logits = logits.masked_fill(~tensor([True if item else False for item in info[index]["action_mask"]],device=DEVICE),float('-inf'))# 去除无法使用的动作
                 policy = softmax(logits,0).log()# 转对数概率密度
-                batch_log_policy.append(policy[actions[index]].item())
+                if batch_log_policy is None:
+                    batch_log_policy = policy[actions[index]].unsqueeze(0)
+                else:
+                    batch_log_policy = torch.cat((batch_log_policy,policy[actions[index]].unsqueeze(0)))
             
-            batch_log_policy = tensor(batch_log_policy,device=DEVICE,dtype=DTYPE)
-            advantages = self._get_GAEs(tensor(rewards,device=DEVICE,dtype=DTYPE), state_values.detach())
+            advantages = self._get_GAEs(tensor(rewards,device=DEVICE,dtype=DTYPE), state_values).detach()
             # 策略比例
-            ratios = torch.exp(logprobs[:-1] - batch_log_policy)
+            ratios = torch.exp(batch_log_policy-logprobs)
 
             # PPO策略损失
             # [:-1]为不计入最后一步的策略损失
             # 策略裁剪
             cliped = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip)
-            loss_policy = -torch.min(ratios, cliped) * advantages[:-1]
+            loss_policy = -torch.min(ratios*advantages[:-1], cliped*advantages[:-1]).mean()
             
             # 价值损失
-            loss_value = self.MseLoss(state_values,self._get_TDλ(tensor(rewards,device=DEVICE,dtype=DTYPE),state_values.detach()))
-            
+            loss_value = self.MseLoss(state_values,self._get_TDλ(tensor(rewards,device=DEVICE,dtype=DTYPE),state_values).detach())
             loss = self.weight_policy * loss_policy + self.weight_value * loss_value
             
             # 优化&记录
             self.optimizer.zero_grad()
-            loss.mean().backward()
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.model.parameters(), MAX_NORM)
             if not call_back is None:
                 call_back(loss.mean().item())
+            for name, param in self.model.named_parameters():
+                if param.grad is not None:
+                    if torch.isnan(param.grad).any():
+                        print(f'NaN gradient in {name}')
             self.optimizer.step()
-        
-        self.loss = loss.mean().item()
         
         self.model_old.load_state_dict(self.model.state_dict())
     
@@ -234,20 +258,18 @@ class Agent:
                 hand_tokens += [185+index]*num
             input_ids += hand_tokens + [0] + history
             input_ids = self._pad_list_to_length(input_ids)
+            memories[player_index].states.append(input_ids)
             input_ids = tensor(input_ids,device=DEVICE)
-            state = input_ids.tolist()
             input_ids = input_ids.unsqueeze(0)# 添加batch
             
             # 添加轨迹
-            memories[player_index].states.append(self._pad_list_to_length(state))
             memories[player_index].rewards.append(reward)
             memories[player_index].is_terminals.append(done)
             memories[player_index].info.append(info)
             if done:
                 # 方便截断的填充
-                memories[player_index].action_logprobs.append(0)
                 memories[player_index].actions.append(0)
-                if VERBOSE_POSITIVE_DONE_REWARD and reward:
+                if VERBOSE_POSITIVE_DONE_REWARD and reward > 5:
                     print(f"终局回报{reward}")
                 # 为所有人添加终端状态
                 for index, memory in enumerate(memories):
@@ -259,13 +281,13 @@ class Agent:
                 break
             
             # 计算策略
-            logits, value = self.model_old(input_ids,self.mask)
+            with torch.no_grad():
+                logits, _ = self.model_old(input_ids,self.mask,no_value=True)
             # 压缩batch
             logits = logits.squeeze(0)
             logits = logits[:-35]# 去除牌型token和[PAD]
             logits = logits.masked_fill(~tensor([True if item else False for item in action_mask],device=DEVICE),float('-inf'))# 去除无法使用的动作
             policy = softmax(logits,0)# 转概率密度
-            value = value.squeeze(1)
             
             # Action(ε贪婪)
             if random.random() > ACTION_EPSILION:
@@ -274,7 +296,6 @@ class Agent:
                 action = self._random_one_index(action_mask)
             
             memories[player_index].actions.append(action)
-            memories[player_index].action_logprobs.append(policy[action].item())
                 
             state, reward, done, info = self.env.step(action)
             round += 1
@@ -342,6 +363,10 @@ if __name__ == "__main__":
         for index, memory in enumerate(agent.replay_buffer.sample(BATCH_SIZE)):
             agent.update(memory,display.loss_update)
             if (index+1) % int(BATCH_SIZE/NDISPLAY) == 0:
-                print(f"完成第{episode+1}轮{index+1}次权重更新\nLoss:{agent.loss}")
-            torch.save(agent.model.state_dict(), PATH)
+                print(f"完成第{episode+1}轮{index+1}次权重更新\nAVR Loss:{sum(display.losses)/len(display.losses)}")
+        print("Saving")
+        torch.save(agent.model.state_dict(), PATH)
+        with open(REPLAY_BUFFER_FILE,"wb") as file:
+            pickle.dump(agent.replay_buffer, file)
+        print("Saved")
         display.reset()

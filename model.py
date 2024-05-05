@@ -3,33 +3,50 @@ import torch.nn as nn
 
 
 class GPTModelWithValue(nn.Module):
-    def __init__(self, vocab_size: int, d_model: int, nhead: int, num_decoder_layers: int, dim_feedforward: int = 2048, dim_value_mlp: int = 1024, dropout: float = 0.1):
+    def __init__(self, vocab_size: int, d_model: int, nhead: int, num_decoder_layers: int, dim_feedforward: int = 2048, dropout: float = 0.1, separation_layer: int = 2, activation="gelu"):
         super(GPTModelWithValue, self).__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
         # 可训练的位置编码(反正牌局不会太长)
         self.positional_encoding = nn.Parameter(torch.zeros(1, 512, d_model))
         self.decoder_layers = nn.ModuleList([
-            nn.TransformerDecoderLayer(d_model, nhead, dim_feedforward, dropout)for _ in range(num_decoder_layers)
+            nn.TransformerDecoderLayer(d_model, nhead, dim_feedforward, dropout, activation=activation)for _ in range(num_decoder_layers)
         ])
-        self.value_head_mlp_1 = nn.Linear(d_model, dim_value_mlp)
-        self.elu = nn.ELU()
-        self.value_head = nn.Linear(dim_value_mlp, 1)  # 价值头，预测最后一个token的价值
+
+        # 价值头
+        self.value_head = nn.Linear(d_model, 1)  # 价值头，预测最后一个token的价值
         # 语言模型头，预测下一个token（action）
         self.lm_head = nn.Linear(d_model, vocab_size)
+        
+        # 策略头和价值头分离的transformer层
+        self.separation_layer = separation_layer
+        self.value_layers = nn.ModuleList([
+            nn.TransformerDecoderLayer(d_model, nhead, dim_feedforward, dropout, activation=activation)for _ in range(separation_layer)
+        ])
+        self.policy_layers = nn.ModuleList([
+            nn.TransformerDecoderLayer(d_model, nhead, dim_feedforward, dropout, activation=activation)for _ in range(separation_layer)
+        ])
 
-    def forward(self, input_ids, mask=None):
+    def forward(self, input_ids, mask=None, no_value = False):
         x = self.embedding(input_ids) + self.positional_encoding[:, :input_ids.size(1), :]
         x = x.permute(1, 0, 2)  # 转换为(seq_length, batch_size, d_model)的形式
 
         for layer in self.decoder_layers:
-            x = layer(x, x, tgt_mask=mask)
-
-        x = x.permute(1, 0, 2)  # 转换回(batch_size, seq_length, d_model)的形式
-
-        logits = self.lm_head(x[:, -1, :])  # 语言模型输出，用于action预测
-        value_output = self.value_head_mlp_1(x[:, -1, :])  # 取每个序列最后一个token的输出来预测价值
-        value_output = self.elu(value_output)
-        value_output = self.value_head(value_output)
+            policy = layer(x, x, tgt_mask=mask)
+        
+        policy = x
+        for layer in self.policy_layers:
+            policy = layer(policy, policy, tgt_mask=mask)
+        policy = policy.permute(1, 0, 2)  # 转换回(batch_size, seq_length, d_model)的形式
+        logits = self.lm_head(policy[:, -1, :])  # 语言模型输出，用于action预测
+        
+        if not no_value:
+            value = x
+            for layer in self.value_layers:
+                value = layer(value, value, tgt_mask=mask)
+            value = value.permute(1, 0, 2)  # 转换回(batch_size, seq_length, d_model)的形式
+            value_output = self.value_head(value[:, -1, :])
+        else:
+            value_output = None
 
         return logits, value_output
 
