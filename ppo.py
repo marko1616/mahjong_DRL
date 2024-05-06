@@ -22,27 +22,27 @@ now = datetime.datetime.now()
 
 # 训练超参数
 MEMGET_NUM_PER_UPDATE = 400
-REPLAY_BUFFER_SIZE = 2500
-EPOCHES_PER_UPDATE = 10
+REPLAY_BUFFER_SIZE = 10000
+EPOCHES_PER_UPDATE = 1
 ACTION_EPSILION = 0.1
 CLIP_EPSILION = 0.2
 WEIGHT_POLICY = 1
-WEIGHT_VALUE = 1.2
-BATCH_SIZE = 200
-EPISODES = 100000
-GAMMA = 1
+WEIGHT_VALUE = 1
+BATCH_SIZE = 350
+EPISODES = 10000
+GAMMA = 0.98
 ALPHA = 0.25
 LAMBD = 0.45
-LR = 5e-5
+LR = 8e-8
 
 # 模型超参数
-NUM_DECODER_LAYERS = 4
+NUM_DECODER_LAYERS = 2
 SEPARATION_LAYER= 2
-DIM_FEEDFORWARD = 2048
+DIM_FEEDFORWARD = 1024
 ENABLE_COMPILE = False
-DIM_VALUE_MLP = 4096
 PAD_TOKEN_ID = 219
 MAX_SEQ_LEN = 512
+ACTION_SIZE = 185
 VOCAB_SIZE = 1 + 184 + 34 + 1# [SEP]，action，手牌，[PAD]
 MAX_NORM = 0.5
 D_MODEL = 1024# 内部feature维度
@@ -52,10 +52,10 @@ NHEAD = 8
 # 计算参数&保存参数&显示参数
 VERBOSE_POSITIVE_DONE_REWARD = True
 REPLAY_BUFFER_FILE = "replay.pkl"
-NDISPLAY = 4
+NDISPLAY = 10
 LOG_DIR = f"runs/{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
 DEVICE = "cuda"
-DTYPE = torch.float
+DTYPE = torch.float32
 PATH = "./mahjong.pt"
 
 def generate_square_subsequent_mask(sz,device):
@@ -94,12 +94,12 @@ class Agent:
         self.weight_value = weight_value
         self.alpha = alpha
         
-        self.model = GPTModelWithValue(VOCAB_SIZE,D_MODEL,NHEAD,NUM_DECODER_LAYERS,DIM_FEEDFORWARD,DROPOUT,SEPARATION_LAYER)
+        self.model = GPTModelWithValue(VOCAB_SIZE,ACTION_SIZE,D_MODEL,NHEAD,NUM_DECODER_LAYERS,DIM_FEEDFORWARD,DROPOUT,SEPARATION_LAYER)
         if os.path.exists(PATH):
             self.model.load_state_dict(torch.load(PATH))
         
         self.optimizer = optim.AdamW(self.model.parameters(), lr=lr)
-        self.model_old = GPTModelWithValue(VOCAB_SIZE,D_MODEL,NHEAD,NUM_DECODER_LAYERS,DIM_FEEDFORWARD,DROPOUT,SEPARATION_LAYER)
+        self.model_old = GPTModelWithValue(VOCAB_SIZE,ACTION_SIZE,D_MODEL,NHEAD,NUM_DECODER_LAYERS,DIM_FEEDFORWARD,DROPOUT,SEPARATION_LAYER)
         self.model_old.load_state_dict(self.model.state_dict())
         self.mask = generate_square_subsequent_mask(MAX_SEQ_LEN,DEVICE)
         
@@ -184,7 +184,6 @@ class Agent:
             if is_terminals[index]:
                 break
             logits = logits.squeeze(0)
-            logits = logits[:-35]# 去除牌型token和[PAD]
             policy = softmax(logits,0).log()
             if logprobs is None:
                 logprobs = policy[actions[index]].unsqueeze(0)
@@ -202,7 +201,6 @@ class Agent:
                 if is_terminals[index]:
                     break
                 logits = logits.squeeze(0)
-                logits = logits[:-35]# 去除牌型token和[PAD]
                 policy = softmax(logits,0).log()# 转对数概率密度
                 if batch_log_policy is None:
                     batch_log_policy = policy[actions[index]].unsqueeze(0)
@@ -285,7 +283,6 @@ class Agent:
                 logits, _ = self.model_old(input_ids,self.mask,no_value=True)
             # 压缩batch
             logits = logits.squeeze(0)
-            logits = logits[:-35]# 去除牌型token和[PAD]
             logits = logits.masked_fill(~tensor([True if item else False for item in action_mask],device=DEVICE),float('-inf'))# 去除无法使用的动作
             policy = softmax(logits,0)# 转概率密度
             

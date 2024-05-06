@@ -3,7 +3,7 @@ import torch.nn as nn
 
 
 class GPTModelWithValue(nn.Module):
-    def __init__(self, vocab_size: int, d_model: int, nhead: int, num_decoder_layers: int, dim_feedforward: int = 2048, dropout: float = 0.1, separation_layer: int = 2, activation="gelu"):
+    def __init__(self, vocab_size: int, action_size:int, d_model: int, nhead: int, num_decoder_layers: int, dim_feedforward: int = 2048, dropout: float = 0.1, separation_layer: int = 2, activation="gelu"):
         super(GPTModelWithValue, self).__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
         # 可训练的位置编码(反正牌局不会太长)
@@ -15,7 +15,7 @@ class GPTModelWithValue(nn.Module):
         # 价值头
         self.value_head = nn.Linear(d_model, 1)  # 价值头，预测最后一个token的价值
         # 语言模型头，预测下一个token（action）
-        self.lm_head = nn.Linear(d_model, vocab_size)
+        self.action_head = nn.Linear(d_model, action_size)
         
         # 策略头和价值头分离的transformer层
         self.separation_layer = separation_layer
@@ -37,7 +37,7 @@ class GPTModelWithValue(nn.Module):
         for layer in self.policy_layers:
             policy = layer(policy, policy, tgt_mask=mask)
         policy = policy.permute(1, 0, 2)  # 转换回(batch_size, seq_length, d_model)的形式
-        logits = self.lm_head(policy[:, -1, :])  # 语言模型输出，用于action预测
+        logits = self.action_head(policy[:, -1, :])  # 语言模型输出，用于action预测
         
         if not no_value:
             value = x
