@@ -21,23 +21,24 @@ from torch import nn
 now = datetime.datetime.now()
 
 # 训练超参数
-MEMGET_NUM_PER_UPDATE = 400
-REPLAY_BUFFER_SIZE = 10000
-EPOCHES_PER_UPDATE = 1
+MEMGET_NUM_PER_UPDATE = 100
+REPLAY_BUFFER_SIZE = 1000
+EPOCHES_PER_UPDATE = 2
 ACTION_EPSILION = 0.1
 CLIP_EPSILION = 0.2
 WEIGHT_POLICY = 1
 WEIGHT_VALUE = 1
-BATCH_SIZE = 350
+N_BATCH_SAMPLE = 4
+BATCH_SIZE = 75
 EPISODES = 10000
 GAMMA = 0.98
 ALPHA = 0.25
 LAMBD = 0.45
-LR = 8e-8
+LR = 1e-5
 
 # 模型超参数
-NUM_DECODER_LAYERS = 2
-SEPARATION_LAYER= 2
+NUM_DECODER_LAYERS = 4
+SEPARATION_LAYER= 4
 DIM_FEEDFORWARD = 1024
 ENABLE_COMPILE = False
 PAD_TOKEN_ID = 219
@@ -162,36 +163,36 @@ class Agent:
     def _pad_list_to_length(self, lst, target_length=MAX_SEQ_LEN, pad_token_id=PAD_TOKEN_ID) -> list:
         return lst + [pad_token_id] * (target_length - len(lst))
 
-    def update(self, memory: Trail, call_back:Callable|None=None) -> None:
-        rewards = memory.rewards
-        actions = memory.actions
-        is_terminals = memory.is_terminals
-        info = memory.info
-        
-        # 获取需要的张量
-        old_states = None
-        for state in memory.states:
-            if old_states is None:
-                old_states = tensor(state,device=DEVICE).unsqueeze(0)
-            else:
-                old_states = torch.cat((old_states,tensor(state,device=DEVICE).unsqueeze(0)),dim=0)
-                
-        # 获取当前在线模型的动作对数概率
-        logprobs = None
-        with torch.no_grad():
-            batch_logits, _ = self.model_old(old_states,self.mask)
-        for index, logits in enumerate(batch_logits):
-            if is_terminals[index]:
-                break
-            logits = logits.squeeze(0)
-            policy = softmax(logits,0).log()
-            if logprobs is None:
-                logprobs = policy[actions[index]].unsqueeze(0)
-            else:
-                logprobs = torch.cat((logprobs,policy[actions[index]].unsqueeze(0)))
+    def update(self, memories: Trail, call_back:Callable|None=None) -> None:
+        for count, memory in enumerate(memories):
+            rewards = memory.rewards
+            actions = memory.actions
+            is_terminals = memory.is_terminals
+            info = memory.info
+            
+            # 获取需要的张量
+            old_states = None
+            for state in memory.states:
+                if old_states is None:
+                    old_states = tensor(state,device=DEVICE).unsqueeze(0)
+                else:
+                    old_states = torch.cat((old_states,tensor(state,device=DEVICE).unsqueeze(0)),dim=0)
+                    
+            # 获取当前在线模型的动作对数概率
+            logprobs = None
+            with torch.no_grad():
+                batch_logits, _ = self.model_old(old_states,self.mask)
+            for index, logits in enumerate(batch_logits):
+                if is_terminals[index]:
+                    break
+                logits = logits.squeeze(0)
+                policy = softmax(logits,0).log()
+                if logprobs is None:
+                    logprobs = policy[actions[index]].unsqueeze(0)
+                else:
+                    logprobs = torch.cat((logprobs,policy[actions[index]].unsqueeze(0)))
 
-        # 优化
-        for _ in range(self.K_epochs):
+            # 优化
             # 获取目前模型的评估
             batch_logits, state_values = self.model(old_states,self.mask)
             state_values = state_values.squeeze(1)
@@ -220,18 +221,21 @@ class Agent:
             # 价值损失
             loss_value = self.MseLoss(state_values,self._get_TDλ(tensor(rewards,device=DEVICE,dtype=DTYPE),state_values).detach())
             loss = self.weight_policy * loss_policy + self.weight_value * loss_value
-            
-            # 优化&记录
-            self.optimizer.zero_grad()
             loss.backward()
-            nn.utils.clip_grad_norm_(self.model.parameters(), MAX_NORM)
-            if not call_back is None:
-                call_back(loss.mean().item())
-            for name, param in self.model.named_parameters():
-                if param.grad is not None:
-                    if torch.isnan(param.grad).any():
-                        print(f'NaN gradient in {name}')
-            self.optimizer.step()
+            
+            # 优化&记录&梯度累计
+            if (count+1)%BATCH_SIZE == 0:
+                print(f"Loss:{loss}")
+                self.optimizer.zero_grad()
+                nn.utils.clip_grad_norm_(self.model.parameters(), MAX_NORM)
+                if not call_back is None:
+                    call_back(loss.mean().item())
+                for name, param in self.model.named_parameters():
+                    if param.grad is not None:
+                        if torch.isnan(param.grad).any():
+                            print(f'NaN gradient in {name}')
+                self.optimizer.step()
+                print(f"完成第{episode+1}轮{count+1}次权重更新\nAVR Loss:{sum(display.losses)/len(display.losses)}")
         
         self.model_old.load_state_dict(self.model.state_dict())
     
@@ -264,6 +268,9 @@ class Agent:
             memories[player_index].rewards.append(reward)
             memories[player_index].is_terminals.append(done)
             memories[player_index].info.append(info)
+            # 更新向听奖励
+            if len(memories[player_index].rewards)>=2:
+                memories[player_index].rewards[-2] += info["reward_update"]
             if done:
                 # 方便截断的填充
                 memories[player_index].actions.append(0)
@@ -357,10 +364,7 @@ if __name__ == "__main__":
             agent.get_memory(display.reward_update)
             if (index+1) % int(MEMGET_NUM_PER_UPDATE/NDISPLAY) == 0:
                 print(f"完成第{episode+1}轮{index+1}次轨迹收集\n平均奖励:{display.avr_reward:.4f}\n最大奖励:{display.max_reward:.4f}\n轨迹平均:{display.avr_reward_per_trail:.4f}\n轨迹最大:{display.max_reward_per_trail:.4f}")
-        for index, memory in enumerate(agent.replay_buffer.sample(BATCH_SIZE)):
-            agent.update(memory,display.loss_update)
-            if (index+1) % int(BATCH_SIZE/NDISPLAY) == 0:
-                print(f"完成第{episode+1}轮{index+1}次权重更新\nAVR Loss:{sum(display.losses)/len(display.losses)}")
+        agent.update(agent.replay_buffer.sample(BATCH_SIZE*N_BATCH_SAMPLE),display.loss_update)
         print("Saving")
         torch.save(agent.model.state_dict(), PATH)
         with open(REPLAY_BUFFER_FILE,"wb") as file:

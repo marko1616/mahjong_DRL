@@ -304,6 +304,8 @@ class MahjongEnv(gym.Env):
 
         action = action - 46*self.seat_now
         reward = 0
+        # 用于追踪摸牌导致向听数奖励并添加到历史R_t-1的info
+        reward_update = 0
         claiming = False
         action_mask = [0]*46
 
@@ -350,7 +352,7 @@ class MahjongEnv(gym.Env):
             shanten = self.shanten_calculator.calculate_shanten(self._get_hand_34_array(self.seat_now))
             if shanten != self.status[self.seat_now]["last_shanten"]:
                 if not self.status[self.seat_now]["first_round"]:
-                    reward += self.status[self.seat_now]["last_shanten"] - shanten
+                    reward_update += self.status[self.seat_now]["last_shanten"] - shanten
             self.status[self.seat_now]["last_shanten"] = shanten
             self.status[self.seat_now]["first_round"] = False
             
@@ -490,7 +492,8 @@ class MahjongEnv(gym.Env):
             "seat": self.seat_now,
             "hand": self._get_hand_34_array(self.seat_now),
         }, reward, self.done, {
-            "action_mask": action_mask
+            "action_mask": action_mask,
+            "reward_update": reward_update
         }
 
     def render(self, mode='human'):
