@@ -8,6 +8,7 @@ from typing import Callable
 
 from env import MahjongEnv
 from model import GPTModelWithValue
+from schedulers import Linear_scheduler
 
 from collections import deque
 
@@ -21,24 +22,29 @@ from torch import nn
 now = datetime.datetime.now()
 
 # 训练超参数
-MEMGET_NUM_PER_UPDATE = 100
-REPLAY_BUFFER_SIZE = 1000
+MEMGET_NUM_PER_UPDATE = 1200
+REPLAY_BUFFER_SIZE = 6000
 EPOCHES_PER_UPDATE = 2
-ACTION_EPSILION = 0.1
+ACTION_EPSILION = 0.025
 CLIP_EPSILION = 0.2
 WEIGHT_POLICY = 1
 WEIGHT_VALUE = 1
-N_BATCH_SAMPLE = 4
-BATCH_SIZE = 75
-EPISODES = 10000
-GAMMA = 0.98
+N_BATCH_SAMPLE = 2
+BATCH_SIZE = 1000
+EPISODES = 1000
+LR = 2.5e-9
+
+# 目标超参数
+TARGET = "N_step_TD"
+LAMBD = 0.65
+GAMMA = 0.99
 ALPHA = 0.25
-LAMBD = 0.45
-LR = 1e-5
+ALPHA_SCHEDULER = Linear_scheduler(100,ALPHA,0.01)
+NTD = 2# TD自举步数
 
 # 模型超参数
-NUM_DECODER_LAYERS = 4
-SEPARATION_LAYER= 4
+NUM_DECODER_LAYERS = 1
+SEPARATION_LAYER= 2
 DIM_FEEDFORWARD = 1024
 ENABLE_COMPILE = False
 PAD_TOKEN_ID = 219
@@ -86,14 +92,14 @@ class ReplayBuffer:
         return samples
     
 class Agent:
-    def __init__(self, lr=LR, gamma=GAMMA, lambd=LAMBD, eps_clip=CLIP_EPSILION, K_epochs=EPOCHES_PER_UPDATE, weight_policy=WEIGHT_POLICY, weight_value=WEIGHT_VALUE, alpha=ALPHA) -> None:
+    def __init__(self, lr=LR, lambd=LAMBD, gamma=GAMMA, eps_clip=CLIP_EPSILION, K_epochs=EPOCHES_PER_UPDATE, weight_policy=WEIGHT_POLICY, weight_value=WEIGHT_VALUE, alpha=ALPHA_SCHEDULER) -> None:
         self.gamma = gamma
-        self.lambd = lambd
         self.eps_clip = eps_clip
         self.K_epochs = K_epochs
         self.weight_policy = weight_policy
         self.weight_value = weight_value
         self.alpha = alpha
+        self.lambd = lambd
         
         self.model = GPTModelWithValue(VOCAB_SIZE,ACTION_SIZE,D_MODEL,NHEAD,NUM_DECODER_LAYERS,DIM_FEEDFORWARD,DROPOUT,SEPARATION_LAYER)
         if os.path.exists(PATH):
@@ -121,35 +127,37 @@ class Agent:
     
     def _get_GAEs(self, rewards, values) -> tensor:
         # 计算delta：即时奖励加上折扣后的下一状态值函数，减去当前状态值函数
-        values = torch.cat([values, tensor([0.0],dtype=DTYPE,device=DEVICE)], dim=0)# 终端后值函数设为0
+        values = torch.cat((values, torch.zeros(1,device=DEVICE,dtype=DTYPE)), dim=0)# 终端后值函数设为0
         deltas = rewards + self.gamma * values[1:] - values[:-1]
         
         # 初始化GAE列表和累计优势
-        gae = 0
-        advs = []
+        gae = torch.zeros(1,device=DEVICE,dtype=DTYPE)
+        advs = None
         
         # 逆向遍历deltas，计算GAE
         for delta in reversed(deltas):
             gae = delta + self.gamma * self.lambd * gae
-            advs.append(gae.item())
-        advs.reverse()
+            advs = gae if advs is None else torch.cat((advs,gae))
+        advs.flip(0)
         
-        return tensor(advs,device=DEVICE,dtype=DTYPE)
+        return advs
 
-    def _get_TDλ(self, rewards:tensor, values:tensor) -> tensor:
-        values = torch.cat([values, tensor([0.0],dtype=DTYPE,device=DEVICE)], dim=0)# 终端后值函数设为0
+    def _get_nTDs(self, rewards:tensor, values:tensor) -> tensor:
+        trace_len = len(rewards)
+
+        # 终端后值函数奖励设为0
+        values = torch.cat((values, torch.zeros(NTD,device=DEVICE,dtype=DTYPE)), dim=0)
+        rewards = torch.cat((rewards, torch.zeros(NTD,device=DEVICE,dtype=DTYPE)), dim=0)
         
-        n = rewards.size(0)
-        deltas = rewards + self.gamma * values[1:] - values[:-1]
-        e = torch.zeros_like(values)
-        value_updates = torch.zeros_like(values)
+        gammas = torch.pow(self.gamma, torch.arange(0, NTD, device=DEVICE,dtype=DTYPE))
         
-        for t in range(n-1):
-            e[t+1] = self.gamma * self.lambd * e[t]
-            e[t] += 1.0
-            value_updates += self.alpha * deltas[t] * e
+        nTDs = None
+        for index in range(trace_len):
+            nTD = rewards[index:index+NTD-1]*gammas[:1]+values[index+NTD]*gammas[-1]
+
+            nTDs = nTD if nTDs is None else torch.cat((nTDs,nTD))
         
-        return (values + value_updates)[:-1]
+        return nTDs
     
     def _random_one_index(self, multihot) -> int:
         # 找出所有值为1的索引
@@ -219,7 +227,9 @@ class Agent:
             loss_policy = -torch.min(ratios*advantages[:-1], cliped*advantages[:-1]).mean()
             
             # 价值损失
-            loss_value = self.MseLoss(state_values,self._get_TDλ(tensor(rewards,device=DEVICE,dtype=DTYPE),state_values).detach())
+            loss_value = self.MseLoss(state_values,
+                                      state_values+(self._get_nTDs(tensor(rewards,device=DEVICE,dtype=DTYPE),state_values)-state_values)*self.alpha.step()
+                                      )
             loss = self.weight_policy * loss_policy + self.weight_value * loss_value
             loss.backward()
             
@@ -229,7 +239,7 @@ class Agent:
                 self.optimizer.zero_grad()
                 nn.utils.clip_grad_norm_(self.model.parameters(), MAX_NORM)
                 if not call_back is None:
-                    call_back(loss.mean().item())
+                    call_back(loss.mean().item(),loss_value.mean().item())
                 for name, param in self.model.named_parameters():
                     if param.grad is not None:
                         if torch.isnan(param.grad).any():
@@ -317,6 +327,7 @@ class Display:
         self.rewards = []
         self.trail_rewards = []
         self.losses = []
+        self.value_losses = []
         
         self.avr_reward = 0
         self.max_reward = 0
@@ -335,11 +346,13 @@ class Display:
         self.avr_reward_per_trail = sum(self.trail_rewards)/len(self.trail_rewards)
         self.max_reward_per_trail = max(self.trail_rewards)
     
-    def loss_update(self, loss:float) -> None:
+    def loss_update(self, loss:float, value_loss:float) -> None:
         self.losses.append(loss)
+        self.value_losses.append(value_loss)
     
     def reset(self) -> None:
-        self.writer.add_scalar('Loss/train', sum(self.losses)/len(self.losses), self.step)
+        self.writer.add_scalar('Loss/loss', sum(self.losses)/len(self.losses), self.step)
+        self.writer.add_scalar('Loss/value loss', sum(self.value_losses)/len(self.value_losses), self.step)
         self.writer.add_scalar('AVR Reward', self.avr_reward, self.step)
         self.writer.add_scalar('AVR Trail Reward', self.avr_reward_per_trail, self.step)
         self.step += 1
@@ -347,6 +360,7 @@ class Display:
         self.rewards = []
         self.trail_rewards = []
         self.losses = []
+        self.value_losses = []
         
         self.avr_reward = 0
         self.max_reward = 0
