@@ -31,7 +31,7 @@ class GPTModelWithValue(nn.Module):
         x = x.permute(1, 0, 2)  # 转换为(seq_length, batch_size, d_model)的形式
 
         for layer in self.decoder_layers:
-            policy = layer(x, x, tgt_mask=mask)
+            x = layer(x, x, tgt_mask=mask)
         
         policy = x
         for layer in self.policy_layers:

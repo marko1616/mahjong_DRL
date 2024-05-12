@@ -350,9 +350,8 @@ class MahjongEnv(gym.Env):
         if action < 35 and not start:
             # 计算本次摸入的牌有无导致向听数减小
             shanten = self.shanten_calculator.calculate_shanten(self._get_hand_34_array(self.seat_now))
-            if shanten != self.status[self.seat_now]["last_shanten"]:
-                if not self.status[self.seat_now]["first_round"]:
-                    reward_update += self.status[self.seat_now]["last_shanten"] - shanten
+            if not self.status[self.seat_now]["first_round"] and shanten != self.status[self.seat_now]["last_shanten"]:
+                    reward_update = (reward_update + self.status[self.seat_now]["last_shanten"] - shanten) if shanten <= self.status[self.seat_now]["last_shanten"] else (reward_update + (self.status[self.seat_now]["last_shanten"] - shanten)*4)
             self.status[self.seat_now]["last_shanten"] = shanten
             self.status[self.seat_now]["first_round"] = False
             

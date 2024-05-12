@@ -19,3 +19,8 @@ class Linear_scheduler(Scheduler):
         
         self.param += self.k
         return self.param
+    
+    def get(self) -> float:
+        if self.param <= self.minimum:
+            return self.minimum
+        return self.param

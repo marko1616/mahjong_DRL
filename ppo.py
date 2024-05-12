@@ -22,37 +22,42 @@ from torch import nn
 now = datetime.datetime.now()
 
 # 训练超参数
-MEMGET_NUM_PER_UPDATE = 1200
-REPLAY_BUFFER_SIZE = 6000
-EPOCHES_PER_UPDATE = 2
-ACTION_EPSILION = 0.025
-CLIP_EPSILION = 0.2
-WEIGHT_POLICY = 1
+MEMGET_NUM_PER_UPDATE = 200
+REPLAY_BUFFER_SIZE = 2000
+EPOCHES_PER_UPDATE = 1
+ACTION_EPSILION = 0.6
+MAX_UPDATE_KL = 3.5
+CLIP_EPSILION = 0.4
+WEIGHT_POLICY = 45
 WEIGHT_VALUE = 1
-N_BATCH_SAMPLE = 2
-BATCH_SIZE = 1000
-EPISODES = 1000
-LR = 2.5e-9
+N_BATCH_SAMPLE = 4
+BATCH_SIZE = 80
+EPISODES = 100
+LR = 1e-13# 我不知道为什么需要如此低的学习率，不这样做会导致策略损失无法收敛
+action_epsilion_scheduler = Linear_scheduler(100,ACTION_EPSILION,0.05)
+
+# 环境超参数
+STABLE_SEED_STEPS = 50# 保持种子在一定时间步内的稳定能增加拟合的可能?也更贴近少初始状态的RL。
 
 # 目标超参数
 TARGET = "N_step_TD"
 LAMBD = 0.65
 GAMMA = 0.99
-ALPHA = 0.25
-ALPHA_SCHEDULER = Linear_scheduler(100,ALPHA,0.01)
+ALPHA = 0.70
 NTD = 2# TD自举步数
+alpha_scheduler = Linear_scheduler(100,ALPHA,0.05)
 
 # 模型超参数
 NUM_DECODER_LAYERS = 1
-SEPARATION_LAYER= 2
-DIM_FEEDFORWARD = 1024
+SEPARATION_LAYER= 10
+DIM_FEEDFORWARD = 512
 ENABLE_COMPILE = False
 PAD_TOKEN_ID = 219
 MAX_SEQ_LEN = 512
 ACTION_SIZE = 185
 VOCAB_SIZE = 1 + 184 + 34 + 1# [SEP]，action，手牌，[PAD]
 MAX_NORM = 0.5
-D_MODEL = 1024# 内部feature维度
+D_MODEL = 768# 内部feature维度
 DROPOUT = 0.1
 NHEAD = 8
 
@@ -92,7 +97,7 @@ class ReplayBuffer:
         return samples
     
 class Agent:
-    def __init__(self, lr=LR, lambd=LAMBD, gamma=GAMMA, eps_clip=CLIP_EPSILION, K_epochs=EPOCHES_PER_UPDATE, weight_policy=WEIGHT_POLICY, weight_value=WEIGHT_VALUE, alpha=ALPHA_SCHEDULER) -> None:
+    def __init__(self, lr=LR, lambd=LAMBD, gamma=GAMMA, eps_clip=CLIP_EPSILION, K_epochs=EPOCHES_PER_UPDATE, weight_policy=WEIGHT_POLICY, weight_value=WEIGHT_VALUE, alpha=alpha_scheduler) -> None:
         self.gamma = gamma
         self.eps_clip = eps_clip
         self.K_epochs = K_epochs
@@ -100,6 +105,8 @@ class Agent:
         self.weight_value = weight_value
         self.alpha = alpha
         self.lambd = lambd
+        self.seed = 0
+        self.seed_count = 0
         
         self.model = GPTModelWithValue(VOCAB_SIZE,ACTION_SIZE,D_MODEL,NHEAD,NUM_DECODER_LAYERS,DIM_FEEDFORWARD,DROPOUT,SEPARATION_LAYER)
         if os.path.exists(PATH):
@@ -135,10 +142,13 @@ class Agent:
         advs = None
         
         # 逆向遍历deltas，计算GAE
-        for delta in reversed(deltas):
+        deltas.flip(0)
+        for delta in deltas:
             gae = delta + self.gamma * self.lambd * gae
             advs = gae if advs is None else torch.cat((advs,gae))
         advs.flip(0)
+        
+        advs = (advs - advs.mean())/advs.std()
         
         return advs
 
@@ -210,7 +220,7 @@ class Agent:
                 if is_terminals[index]:
                     break
                 logits = logits.squeeze(0)
-                policy = softmax(logits,0).log()# 转对数概率密度
+                policy = softmax(logits,0).log()
                 if batch_log_policy is None:
                     batch_log_policy = policy[actions[index]].unsqueeze(0)
                 else:
@@ -219,6 +229,10 @@ class Agent:
             advantages = self._get_GAEs(tensor(rewards,device=DEVICE,dtype=DTYPE), state_values).detach()
             # 策略比例
             ratios = torch.exp(batch_log_policy-logprobs)
+            kl = nn.functional.kl_div(input=logprobs,target=batch_log_policy,reduction='sum',log_target=True).item()
+            if kl > MAX_UPDATE_KL:
+                print(f"KL break\nKl{kl}")
+                break
 
             # PPO策略损失
             # [:-1]为不计入最后一步的策略损失
@@ -230,22 +244,29 @@ class Agent:
             loss_value = self.MseLoss(state_values,
                                       state_values+(self._get_nTDs(tensor(rewards,device=DEVICE,dtype=DTYPE),state_values)-state_values)*self.alpha.step()
                                       )
-            loss = self.weight_policy * loss_policy + self.weight_value * loss_value
+            loss_value = self.weight_value * loss_value
+            loss_policy = self.weight_policy * loss_policy
+            loss = loss_policy + loss_value
             loss.backward()
+            if not call_back is None:
+                call_back(loss.mean().item(),loss_value.mean().item(),loss_policy.mean().item())
             
             # 优化&记录&梯度累计
-            if (count+1)%BATCH_SIZE == 0:
-                print(f"Loss:{loss}")
+            if (count+1)%int(BATCH_SIZE) == 0:
                 self.optimizer.zero_grad()
                 nn.utils.clip_grad_norm_(self.model.parameters(), MAX_NORM)
-                if not call_back is None:
-                    call_back(loss.mean().item(),loss_value.mean().item())
                 for name, param in self.model.named_parameters():
                     if param.grad is not None:
                         if torch.isnan(param.grad).any():
                             print(f'NaN gradient in {name}')
                 self.optimizer.step()
-                print(f"完成第{episode+1}轮{count+1}次权重更新\nAVR Loss:{sum(display.losses)/len(display.losses)}")
+                print(f"完成第{episode+1}轮{count+1}次权重更新")
+            if (count+1)%int(BATCH_SIZE/NDISPLAY) == 0:
+                print(f"Loss:{loss}")
+                print(f"Value loss:{loss_value}")
+                print(f"Policy loss:{loss_policy}")
+                print(f"AVR Loss:{sum(display.losses)/len(display.losses)}\nAVR Value Loss:{sum(display.value_losses)/len(display.value_losses)}\nAVR Policy Loss:{sum(display.policy_losses)/len(display.policy_losses)}")
+                print(f"Policy kl:{kl}")
         
         self.model_old.load_state_dict(self.model.state_dict())
     
@@ -254,7 +275,12 @@ class Agent:
         round = 0
         # 鉴于有四个智能体我们一次收集四分经验
         memories = [Trail() for _ in range(4)]
+        random.seed(self.seed)
+        self.seed_count += 1
         state, reward, done, info = self.env.reset()
+        if self.seed_count >= STABLE_SEED_STEPS:
+            self.seed_count = 0
+            self.seed += 1
         no_memory_index = []
         while True:
             action_mask = info["action_mask"]
@@ -304,7 +330,7 @@ class Agent:
             policy = softmax(logits,0)# 转概率密度
             
             # Action(ε贪婪)
-            if random.random() > ACTION_EPSILION:
+            if random.random() > action_epsilion_scheduler.get():
                 action = torch.multinomial(policy,1).item()
             else:
                 action = self._random_one_index(action_mask)
@@ -320,7 +346,8 @@ class Agent:
                     call_back(memory.rewards)
         
         for memory in memories:
-            self.replay_buffer.add(memory)
+            if memory:
+                self.replay_buffer.add(memory)
 
 class Display:
     def __init__(self) -> None:
@@ -328,6 +355,7 @@ class Display:
         self.trail_rewards = []
         self.losses = []
         self.value_losses = []
+        self.policy_losses = []
         
         self.avr_reward = 0
         self.max_reward = 0
@@ -346,13 +374,15 @@ class Display:
         self.avr_reward_per_trail = sum(self.trail_rewards)/len(self.trail_rewards)
         self.max_reward_per_trail = max(self.trail_rewards)
     
-    def loss_update(self, loss:float, value_loss:float) -> None:
+    def loss_update(self, loss:float, value_loss:float, policy_loss:float) -> None:
         self.losses.append(loss)
         self.value_losses.append(value_loss)
+        self.policy_losses.append(policy_loss)
     
     def reset(self) -> None:
         self.writer.add_scalar('Loss/loss', sum(self.losses)/len(self.losses), self.step)
         self.writer.add_scalar('Loss/value loss', sum(self.value_losses)/len(self.value_losses), self.step)
+        self.writer.add_scalar('Loss/policy loss', sum(self.policy_losses)/len(self.policy_losses), self.step)
         self.writer.add_scalar('AVR Reward', self.avr_reward, self.step)
         self.writer.add_scalar('AVR Trail Reward', self.avr_reward_per_trail, self.step)
         self.step += 1
@@ -361,6 +391,7 @@ class Display:
         self.trail_rewards = []
         self.losses = []
         self.value_losses = []
+        self.policy_losses = []
         
         self.avr_reward = 0
         self.max_reward = 0
@@ -385,3 +416,4 @@ if __name__ == "__main__":
             pickle.dump(agent.replay_buffer, file)
         print("Saved")
         display.reset()
+    action_epsilion_scheduler.step()
