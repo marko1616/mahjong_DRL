@@ -3,7 +3,7 @@ import torch.nn as nn
 
 
 class GPTModelWithValue(nn.Module):
-    def __init__(self, vocab_size: int, action_size:int, d_model: int, nhead: int, num_decoder_layers: int, dim_feedforward: int = 2048, dropout: float = 0.1, separation_layer: int = 2, activation="gelu"):
+    def __init__(self, vocab_size: int, action_size:int, d_model: int, nhead: int, num_decoder_layers: int, dim_feedforward: int = 2048, dropout: float = 0.1, separation_layer_policy: int = 2,separation_layer_value: int = 2 , activation="gelu"):
         super(GPTModelWithValue, self).__init__()
         self.embedding = nn.Embedding(vocab_size, d_model)
         # 可训练的位置编码(反正牌局不会太长)
@@ -18,31 +18,30 @@ class GPTModelWithValue(nn.Module):
         self.action_head = nn.Linear(d_model, action_size)
         
         # 策略头和价值头分离的transformer层
-        self.separation_layer = separation_layer
         self.value_layers = nn.ModuleList([
-            nn.TransformerDecoderLayer(d_model, nhead, dim_feedforward, dropout, activation=activation)for _ in range(separation_layer)
+            nn.TransformerDecoderLayer(d_model, nhead, dim_feedforward, dropout, activation=activation)for _ in range(separation_layer_value)
         ])
         self.policy_layers = nn.ModuleList([
-            nn.TransformerDecoderLayer(d_model, nhead, dim_feedforward, dropout, activation=activation)for _ in range(separation_layer)
+            nn.TransformerDecoderLayer(d_model, nhead, dim_feedforward, dropout, activation=activation)for _ in range(separation_layer_policy)
         ])
 
-    def forward(self, input_ids, mask=None, no_value = False):
+    def forward(self, input_ids, no_value = False):
         x = self.embedding(input_ids) + self.positional_encoding[:, :input_ids.size(1), :]
         x = x.permute(1, 0, 2)  # 转换为(seq_length, batch_size, d_model)的形式
 
         for layer in self.decoder_layers:
-            x = layer(x, x, tgt_mask=mask)
+            x = layer(x, x)
         
         policy = x
         for layer in self.policy_layers:
-            policy = layer(policy, policy, tgt_mask=mask)
+            policy = layer(policy, policy)
         policy = policy.permute(1, 0, 2)  # 转换回(batch_size, seq_length, d_model)的形式
         logits = self.action_head(policy[:, -1, :])  # 语言模型输出，用于action预测
         
         if not no_value:
             value = x
             for layer in self.value_layers:
-                value = layer(value, value, tgt_mask=mask)
+                value = layer(value, value)
             value = value.permute(1, 0, 2)  # 转换回(batch_size, seq_length, d_model)的形式
             value_output = self.value_head(value[:, -1, :])
         else:

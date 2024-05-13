@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import pickle
 import random
 import datetime
@@ -22,34 +23,37 @@ from torch import nn
 now = datetime.datetime.now()
 
 # 训练超参数
-MEMGET_NUM_PER_UPDATE = 200
-REPLAY_BUFFER_SIZE = 2000
+MEMGET_NUM_PER_UPDATE = 80
+REPLAY_BUFFER_SIZE = 500
 EPOCHES_PER_UPDATE = 1
-ACTION_EPSILION = 0.6
-MAX_UPDATE_KL = 3.5
+ACTION_EPSILION = 0.2
+MAX_UPDATE_KL = 0.8
 CLIP_EPSILION = 0.4
-WEIGHT_POLICY = 45
-WEIGHT_VALUE = 1
-N_BATCH_SAMPLE = 4
-BATCH_SIZE = 80
+WEIGHT_POLICY = 1
+WEIGHT_VALUE = 1.5
+N_BATCH_SAMPLE = 8
+BATCH_SIZE = 20
 EPISODES = 100
-LR = 1e-13# 我不知道为什么需要如此低的学习率，不这样做会导致策略损失无法收敛
-action_epsilion_scheduler = Linear_scheduler(100,ACTION_EPSILION,0.05)
+BTEA = 0.1
+LR = 1e-4
+action_epsilion_scheduler = Linear_scheduler(100,ACTION_EPSILION,0.0025)
 
 # 环境超参数
+ACTION_TEMPERATURE = 0.1
 STABLE_SEED_STEPS = 50# 保持种子在一定时间步内的稳定能增加拟合的可能?也更贴近少初始状态的RL。
 
 # 目标超参数
 TARGET = "N_step_TD"
-LAMBD = 0.65
+LAMBD = 0.25
 GAMMA = 0.99
-ALPHA = 0.70
+ALPHA = 0.50
 NTD = 2# TD自举步数
 alpha_scheduler = Linear_scheduler(100,ALPHA,0.05)
 
 # 模型超参数
 NUM_DECODER_LAYERS = 1
-SEPARATION_LAYER= 10
+SEPARATION_LAYER_POLICY = 8
+SEPARATION_LAYER_VALUE = 5
 DIM_FEEDFORWARD = 512
 ENABLE_COMPILE = False
 PAD_TOKEN_ID = 219
@@ -67,13 +71,8 @@ REPLAY_BUFFER_FILE = "replay.pkl"
 NDISPLAY = 10
 LOG_DIR = f"runs/{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
 DEVICE = "cuda"
-DTYPE = torch.float32
+DTYPE = torch.float
 PATH = "./mahjong.pt"
-
-def generate_square_subsequent_mask(sz,device):
-    mask = (torch.triu(torch.ones(sz, sz, device=device, dtype=DTYPE)) == 1).transpose(0, 1)
-    mask = mask.float().masked_fill(mask == 0, float('-inf')).masked_fill(mask == 1, float(0.0))
-    return mask
 
 @dataclass
 class Trail:
@@ -97,25 +96,25 @@ class ReplayBuffer:
         return samples
     
 class Agent:
-    def __init__(self, lr=LR, lambd=LAMBD, gamma=GAMMA, eps_clip=CLIP_EPSILION, K_epochs=EPOCHES_PER_UPDATE, weight_policy=WEIGHT_POLICY, weight_value=WEIGHT_VALUE, alpha=alpha_scheduler) -> None:
+    def __init__(self, lr=LR, lambd=LAMBD, gamma=GAMMA, eps_clip=CLIP_EPSILION, K_epochs=EPOCHES_PER_UPDATE, weight_policy=WEIGHT_POLICY, weight_value=WEIGHT_VALUE, alpha=alpha_scheduler, beta=BTEA) -> None:
         self.gamma = gamma
         self.eps_clip = eps_clip
         self.K_epochs = K_epochs
         self.weight_policy = weight_policy
         self.weight_value = weight_value
         self.alpha = alpha
+        self.beta = beta
         self.lambd = lambd
         self.seed = 0
         self.seed_count = 0
         
-        self.model = GPTModelWithValue(VOCAB_SIZE,ACTION_SIZE,D_MODEL,NHEAD,NUM_DECODER_LAYERS,DIM_FEEDFORWARD,DROPOUT,SEPARATION_LAYER)
+        self.model = GPTModelWithValue(VOCAB_SIZE,ACTION_SIZE,D_MODEL,NHEAD,NUM_DECODER_LAYERS,DIM_FEEDFORWARD,DROPOUT,SEPARATION_LAYER_POLICY,SEPARATION_LAYER_VALUE)
         if os.path.exists(PATH):
             self.model.load_state_dict(torch.load(PATH))
         
         self.optimizer = optim.AdamW(self.model.parameters(), lr=lr)
-        self.model_old = GPTModelWithValue(VOCAB_SIZE,ACTION_SIZE,D_MODEL,NHEAD,NUM_DECODER_LAYERS,DIM_FEEDFORWARD,DROPOUT,SEPARATION_LAYER)
+        self.model_old = GPTModelWithValue(VOCAB_SIZE,ACTION_SIZE,D_MODEL,NHEAD,NUM_DECODER_LAYERS,DIM_FEEDFORWARD,DROPOUT,SEPARATION_LAYER_POLICY,SEPARATION_LAYER_VALUE)
         self.model_old.load_state_dict(self.model.state_dict())
-        self.mask = generate_square_subsequent_mask(MAX_SEQ_LEN,DEVICE)
         
         self.MseLoss = nn.MSELoss()
         
@@ -133,9 +132,11 @@ class Agent:
             self.model_old = torch.compile(self.model_old)
     
     def _get_GAEs(self, rewards, values) -> tensor:
+        ending = torch.ones(len(rewards),device=DEVICE,dtype=DTYPE)
+        ending[:-1] = 0
         # 计算delta：即时奖励加上折扣后的下一状态值函数，减去当前状态值函数
         values = torch.cat((values, torch.zeros(1,device=DEVICE,dtype=DTYPE)), dim=0)# 终端后值函数设为0
-        deltas = rewards + self.gamma * values[1:] - values[:-1]
+        deltas = rewards + self.gamma * values[1:] - values[:-1] * ending
         
         # 初始化GAE列表和累计优势
         gae = torch.zeros(1,device=DEVICE,dtype=DTYPE)
@@ -143,12 +144,10 @@ class Agent:
         
         # 逆向遍历deltas，计算GAE
         deltas.flip(0)
-        for delta in deltas:
-            gae = delta + self.gamma * self.lambd * gae
+        for index, delta in enumerate(deltas[:-1]):
+            gae = delta + self.gamma * self.lambd * gae * ending[index]
             advs = gae if advs is None else torch.cat((advs,gae))
         advs.flip(0)
-        
-        advs = (advs - advs.mean())/advs.std()
         
         return advs
 
@@ -182,6 +181,7 @@ class Agent:
         return lst + [pad_token_id] * (target_length - len(lst))
 
     def update(self, memories: Trail, call_back:Callable|None=None) -> None:
+        kls = []
         for count, memory in enumerate(memories):
             rewards = memory.rewards
             actions = memory.actions
@@ -199,7 +199,7 @@ class Agent:
             # 获取当前在线模型的动作对数概率
             logprobs = None
             with torch.no_grad():
-                batch_logits, _ = self.model_old(old_states,self.mask)
+                batch_logits, _ = self.model_old(old_states)
             for index, logits in enumerate(batch_logits):
                 if is_terminals[index]:
                     break
@@ -212,7 +212,7 @@ class Agent:
 
             # 优化
             # 获取目前模型的评估
-            batch_logits, state_values = self.model(old_states,self.mask)
+            batch_logits, state_values = self.model(old_states)
             state_values = state_values.squeeze(1)
             
             batch_log_policy = None
@@ -229,16 +229,17 @@ class Agent:
             advantages = self._get_GAEs(tensor(rewards,device=DEVICE,dtype=DTYPE), state_values).detach()
             # 策略比例
             ratios = torch.exp(batch_log_policy-logprobs)
-            kl = nn.functional.kl_div(input=logprobs,target=batch_log_policy,reduction='sum',log_target=True).item()
+            kl = nn.functional.kl_div(logprobs,batch_log_policy,reduction='sum',log_target=True)
+            kls.append(kl.item())
             if kl > MAX_UPDATE_KL:
-                print(f"KL break\nKl{kl}")
+                print(f"KL break\nKl:{kl}")
                 break
 
             # PPO策略损失
             # [:-1]为不计入最后一步的策略损失
-            # 策略裁剪
-            cliped = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip)
-            loss_policy = -torch.min(ratios*advantages[:-1], cliped*advantages[:-1]).mean()
+            # 策略裁剪(不使用是因为这似乎会导致梯度很容易无法传播)
+            # cliped = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip)
+            loss_policy = -ratios*advantages - self.beta*kl
             
             # 价值损失
             loss_value = self.MseLoss(state_values,
@@ -247,26 +248,29 @@ class Agent:
             loss_value = self.weight_value * loss_value
             loss_policy = self.weight_policy * loss_policy
             loss = loss_policy + loss_value
+            loss_policy = loss_policy.mean()
+            loss = loss.mean()
+            loss = loss/int(BATCH_SIZE)#梯度累计正则化
             loss.backward()
             if not call_back is None:
                 call_back(loss.mean().item(),loss_value.mean().item(),loss_policy.mean().item())
             
             # 优化&记录&梯度累计
             if (count+1)%int(BATCH_SIZE) == 0:
-                self.optimizer.zero_grad()
                 nn.utils.clip_grad_norm_(self.model.parameters(), MAX_NORM)
                 for name, param in self.model.named_parameters():
                     if param.grad is not None:
                         if torch.isnan(param.grad).any():
                             print(f'NaN gradient in {name}')
                 self.optimizer.step()
+                self.optimizer.zero_grad()
                 print(f"完成第{episode+1}轮{count+1}次权重更新")
             if (count+1)%int(BATCH_SIZE/NDISPLAY) == 0:
                 print(f"Loss:{loss}")
                 print(f"Value loss:{loss_value}")
                 print(f"Policy loss:{loss_policy}")
                 print(f"AVR Loss:{sum(display.losses)/len(display.losses)}\nAVR Value Loss:{sum(display.value_losses)/len(display.value_losses)}\nAVR Policy Loss:{sum(display.policy_losses)/len(display.policy_losses)}")
-                print(f"Policy kl:{kl}")
+                print(f"AVR Policy kl:{sum(kls)/len(kls)}")
         
         self.model_old.load_state_dict(self.model.state_dict())
     
@@ -323,13 +327,14 @@ class Agent:
             
             # 计算策略
             with torch.no_grad():
-                logits, _ = self.model_old(input_ids,self.mask,no_value=True)
+                logits, _ = self.model_old(input_ids,no_value=True)
             # 压缩batch
             logits = logits.squeeze(0)
             logits = logits.masked_fill(~tensor([True if item else False for item in action_mask],device=DEVICE),float('-inf'))# 去除无法使用的动作
-            policy = softmax(logits,0)# 转概率密度
+            policy = softmax(logits/ACTION_TEMPERATURE,0)# 转概率密度
             
-            # Action(ε贪婪)
+            # Action(ε贪婪)，而且我们显然不希望采样到同样的轨迹训练
+            random.seed(time.time())
             if random.random() > action_epsilion_scheduler.get():
                 action = torch.multinomial(policy,1).item()
             else:
@@ -411,9 +416,9 @@ if __name__ == "__main__":
                 print(f"完成第{episode+1}轮{index+1}次轨迹收集\n平均奖励:{display.avr_reward:.4f}\n最大奖励:{display.max_reward:.4f}\n轨迹平均:{display.avr_reward_per_trail:.4f}\n轨迹最大:{display.max_reward_per_trail:.4f}")
         agent.update(agent.replay_buffer.sample(BATCH_SIZE*N_BATCH_SAMPLE),display.loss_update)
         print("Saving")
-        torch.save(agent.model.state_dict(), PATH)
+        torch.save(agent.model_old.state_dict(), PATH)
         with open(REPLAY_BUFFER_FILE,"wb") as file:
             pickle.dump(agent.replay_buffer, file)
         print("Saved")
         display.reset()
-    action_epsilion_scheduler.step()
+        action_epsilion_scheduler.step()
