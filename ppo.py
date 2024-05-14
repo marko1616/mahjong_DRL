@@ -23,20 +23,21 @@ from torch import nn
 now = datetime.datetime.now()
 
 # 训练超参数
-MEMGET_NUM_PER_UPDATE = 100
-REPLAY_BUFFER_SIZE = 500
+MEMGET_NUM_PER_UPDATE = 20
+REPLAY_BUFFER_SIZE = 2000
 EPOCHES_PER_UPDATE = 1
 ACTION_EPSILION = 0.2
-MAX_UPDATE_KL = 0.8
+MAX_UPDATE_KL = 1
 CLIP_EPSILION = 0.4
 WEIGHT_POLICY = 1
 WEIGHT_VALUE = 1.5
-N_BATCH_SAMPLE = 3
-BATCH_SIZE = 40
-EPISODES = 25
-BTEA = 0.1
-LR = 1e-5
-action_epsilion_scheduler = Linear_scheduler(25,ACTION_EPSILION,0.0025)
+N_BATCH_SAMPLE = 14
+BATCH_SIZE = 60
+EPISODES = 50
+BTEA = 2
+LR_VALUE = 8e-6
+LR_POLICY = 1e-5
+action_epsilion_scheduler = Linear_scheduler(50,ACTION_EPSILION,0.0025)
 
 # 环境超参数
 ACTION_TEMPERATURE = 0.1
@@ -46,9 +47,9 @@ STABLE_SEED_STEPS = 25# 保持种子在一定时间步内的稳定能增加拟�
 TARGET = "N_step_TD"
 LAMBD = 0.10
 GAMMA = 0.99
-ALPHA = 0.50
-NTD = 2# TD自举步数
-alpha_scheduler = Linear_scheduler(25,ALPHA,0.05)
+ALPHA = 0.65
+NTD = 4# TD自举步数
+alpha_scheduler = Linear_scheduler(50,ALPHA,0.10)
 
 # 模型超参数
 SEPARATION_LAYER_POLICY = 5
@@ -103,7 +104,7 @@ class ReplayBuffer:
         return samples
     
 class Agent:
-    def __init__(self, lr=LR, lambd=LAMBD, gamma=GAMMA, eps_clip=CLIP_EPSILION, K_epochs=EPOCHES_PER_UPDATE, weight_policy=WEIGHT_POLICY, weight_value=WEIGHT_VALUE, alpha=alpha_scheduler, beta=BTEA) -> None:
+    def __init__(self, lambd=LAMBD, gamma=GAMMA, eps_clip=CLIP_EPSILION, K_epochs=EPOCHES_PER_UPDATE, weight_policy=WEIGHT_POLICY, weight_value=WEIGHT_VALUE, alpha=alpha_scheduler, beta=BTEA) -> None:
         self.gamma = gamma
         self.eps_clip = eps_clip
         self.K_epochs = K_epochs
@@ -123,18 +124,20 @@ class Agent:
         config.out_size = 185
         config.block_size = 512
         self.policy_model = GPTModel(config)
-        if os.path.exists(PATH):
-            self.policy_model.load_state_dict(torch.load(f"{PATH_MAX}_policy.pt"))
-        self.optimizer_policy = optim.AdamW(self.policy_model.parameters(), lr=lr)
+        if os.path.exists(f"{PATH_MAX}_policy_max.pt"):
+            self.policy_model.load_state_dict(torch.load(f"{PATH_MAX}_policy_max.pt"))
+            print("Loaded")
+        self.optimizer_policy = optim.AdamW(self.policy_model.parameters(), lr=LR_POLICY)
         self.policy_model_old = GPTModel(config)
         self.policy_model_old.load_state_dict(self.policy_model.state_dict())
 
         config.n_layer = SEPARATION_LAYER_VALUE
         config.out_size = 1
         self.value_model = GPTModel(config)
-        if os.path.exists(PATH):
-            self.value_model.load_state_dict(torch.load(f"{PATH_MAX}_value.pt"))
-        self.optimizer_value = optim.AdamW(self.value_model.parameters(), lr=lr)
+        if os.path.exists(f"{PATH_MAX}_value_max.pt"):
+            self.value_model.load_state_dict(torch.load(f"{PATH_MAX}_value_max.pt"))
+            print("Loaded")
+        self.optimizer_value = optim.AdamW(self.value_model.parameters(), lr=LR_VALUE)
         self.value_model_old = GPTModel(config)
         self.value_model_old.load_state_dict(self.value_model.state_dict())  
         
@@ -188,7 +191,8 @@ class Agent:
         
         nTDs = None
         for index in range(trace_len):
-            nTD = rewards[index:index+NTD-1]*gammas[:1]+values[index+NTD]*gammas[-1]
+            nTD = torch.sum(rewards[index:index+NTD-1]*gammas[:-1])+values[index+NTD]*gammas[-1]
+            nTD = nTD.unsqueeze(0)
 
             nTDs = nTD if nTDs is None else torch.cat((nTDs,nTD))
         
@@ -270,7 +274,7 @@ class Agent:
             
             # 价值损失
             loss_value = self.MseLoss(state_values,
-                                      state_values+(self._get_nTDs(tensor(rewards,device=DEVICE,dtype=DTYPE),state_values)-state_values)*self.alpha.step()
+                                      (state_values+(self._get_nTDs(tensor(rewards,device=DEVICE,dtype=DTYPE),state_values)-state_values)*self.alpha.step()).detach()
                                       )
             loss_value = self.weight_value * loss_value
             loss_policy = self.weight_policy * loss_policy
@@ -455,8 +459,8 @@ if __name__ == "__main__":
             torch.save(agent.policy_model_old.state_dict(), f"{PATH}_policy.pt")
             torch.save(agent.value_model_old.state_dict(), f"{PATH}_value.pt")
             if display.avr_reward >= current_max:
-                torch.save(agent.policy_model_old.state_dict(), f"{PATH_MAX}_policy.pt")
-                torch.save(agent.value_model_old.state_dict(), f"{PATH_MAX}_value.pt")
+                torch.save(agent.policy_model_old.state_dict(), f"{PATH_MAX}_policy_max.pt")
+                torch.save(agent.value_model_old.state_dict(), f"{PATH_MAX}_value_max.pt")
                 current_max = display.avr_reward
             with open(REPLAY_BUFFER_FILE,"wb") as file:
                 pickle.dump(agent.replay_buffer, file)
