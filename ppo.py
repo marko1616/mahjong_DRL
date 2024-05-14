@@ -8,7 +8,7 @@ from dataclasses import dataclass, field
 from typing import Callable
 
 from env import MahjongEnv
-from model import GPTModelWithValue
+from model import GPTModel
 from schedulers import Linear_scheduler
 
 from collections import deque
@@ -23,7 +23,7 @@ from torch import nn
 now = datetime.datetime.now()
 
 # 训练超参数
-MEMGET_NUM_PER_UPDATE = 80
+MEMGET_NUM_PER_UPDATE = 100
 REPLAY_BUFFER_SIZE = 500
 EPOCHES_PER_UPDATE = 1
 ACTION_EPSILION = 0.2
@@ -31,29 +31,28 @@ MAX_UPDATE_KL = 0.8
 CLIP_EPSILION = 0.4
 WEIGHT_POLICY = 1
 WEIGHT_VALUE = 1.5
-N_BATCH_SAMPLE = 8
-BATCH_SIZE = 20
-EPISODES = 100
+N_BATCH_SAMPLE = 3
+BATCH_SIZE = 40
+EPISODES = 25
 BTEA = 0.1
-LR = 1e-4
-action_epsilion_scheduler = Linear_scheduler(100,ACTION_EPSILION,0.0025)
+LR = 1e-5
+action_epsilion_scheduler = Linear_scheduler(25,ACTION_EPSILION,0.0025)
 
 # 环境超参数
 ACTION_TEMPERATURE = 0.1
-STABLE_SEED_STEPS = 50# 保持种子在一定时间步内的稳定能增加拟合的可能?也更贴近少初始状态的RL。
+STABLE_SEED_STEPS = 25# 保持种子在一定时间步内的稳定能增加拟合的可能?也更贴近少初始状态的RL。
 
 # 目标超参数
 TARGET = "N_step_TD"
-LAMBD = 0.25
+LAMBD = 0.10
 GAMMA = 0.99
 ALPHA = 0.50
 NTD = 2# TD自举步数
-alpha_scheduler = Linear_scheduler(100,ALPHA,0.05)
+alpha_scheduler = Linear_scheduler(25,ALPHA,0.05)
 
 # 模型超参数
-NUM_DECODER_LAYERS = 1
-SEPARATION_LAYER_POLICY = 8
-SEPARATION_LAYER_VALUE = 5
+SEPARATION_LAYER_POLICY = 5
+SEPARATION_LAYER_VALUE = 4
 DIM_FEEDFORWARD = 512
 ENABLE_COMPILE = False
 PAD_TOKEN_ID = 219
@@ -72,7 +71,15 @@ NDISPLAY = 10
 LOG_DIR = f"runs/{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
 DEVICE = "cuda"
 DTYPE = torch.float
-PATH = "./mahjong.pt"
+PATH = "./mahjong"
+PATH_MAX = "./max"
+
+EVAL = False
+if EVAL:
+    PATH = PATH_MAX
+    ACTION_EPSILION = 0
+    MEMGET_NUM_PER_UPDATE = 1000
+    NDISPLAY = int(MEMGET_NUM_PER_UPDATE/2)
 
 @dataclass
 class Trail:
@@ -108,13 +115,28 @@ class Agent:
         self.seed = 0
         self.seed_count = 0
         
-        self.model = GPTModelWithValue(VOCAB_SIZE,ACTION_SIZE,D_MODEL,NHEAD,NUM_DECODER_LAYERS,DIM_FEEDFORWARD,DROPOUT,SEPARATION_LAYER_POLICY,SEPARATION_LAYER_VALUE)
+        config = GPTModel.get_default_config()
+        config.n_layer = SEPARATION_LAYER_POLICY
+        config.n_head = NHEAD
+        config.n_embd = D_MODEL
+        config.vocab_size = VOCAB_SIZE
+        config.out_size = 185
+        config.block_size = 512
+        self.policy_model = GPTModel(config)
         if os.path.exists(PATH):
-            self.model.load_state_dict(torch.load(PATH))
-        
-        self.optimizer = optim.AdamW(self.model.parameters(), lr=lr)
-        self.model_old = GPTModelWithValue(VOCAB_SIZE,ACTION_SIZE,D_MODEL,NHEAD,NUM_DECODER_LAYERS,DIM_FEEDFORWARD,DROPOUT,SEPARATION_LAYER_POLICY,SEPARATION_LAYER_VALUE)
-        self.model_old.load_state_dict(self.model.state_dict())
+            self.policy_model.load_state_dict(torch.load(f"{PATH_MAX}_policy.pt"))
+        self.optimizer_policy = optim.AdamW(self.policy_model.parameters(), lr=lr)
+        self.policy_model_old = GPTModel(config)
+        self.policy_model_old.load_state_dict(self.policy_model.state_dict())
+
+        config.n_layer = SEPARATION_LAYER_VALUE
+        config.out_size = 1
+        self.value_model = GPTModel(config)
+        if os.path.exists(PATH):
+            self.value_model.load_state_dict(torch.load(f"{PATH_MAX}_value.pt"))
+        self.optimizer_value = optim.AdamW(self.value_model.parameters(), lr=lr)
+        self.value_model_old = GPTModel(config)
+        self.value_model_old.load_state_dict(self.value_model.state_dict())  
         
         self.MseLoss = nn.MSELoss()
         
@@ -125,11 +147,15 @@ class Agent:
             self.replay_buffer = ReplayBuffer()
         self.env = MahjongEnv()
         
-        self.model.to(DEVICE,DTYPE)
-        self.model_old.to(DEVICE,DTYPE)
+        self.policy_model.to(DEVICE,DTYPE)
+        self.policy_model_old.to(DEVICE,DTYPE)
+        self.value_model.to(DEVICE,DTYPE)
+        self.value_model_old.to(DEVICE,DTYPE)
         if sys.platform.startswith("linux") and ENABLE_COMPILE:
-            self.model = torch.compile(self.model)
-            self.model_old = torch.compile(self.model_old)
+            self.policy_model = torch.compile(self.policy_model)
+            self.policy_model_old = torch.compile(self.policy_model_old)
+            self.value_model = torch.compile(self.value_model)
+            self.value_model_old = torch.compile(self.value_model_old)
     
     def _get_GAEs(self, rewards, values) -> tensor:
         ending = torch.ones(len(rewards),device=DEVICE,dtype=DTYPE)
@@ -199,7 +225,7 @@ class Agent:
             # 获取当前在线模型的动作对数概率
             logprobs = None
             with torch.no_grad():
-                batch_logits, _ = self.model_old(old_states)
+                batch_logits = self.policy_model_old(old_states)[:,-1,:]
             for index, logits in enumerate(batch_logits):
                 if is_terminals[index]:
                     break
@@ -212,7 +238,8 @@ class Agent:
 
             # 优化
             # 获取目前模型的评估
-            batch_logits, state_values = self.model(old_states)
+            batch_logits = self.policy_model(old_states)[:,-1,:]
+            state_values = self.value_model(old_states)[:,-1,:]
             state_values = state_values.squeeze(1)
             
             batch_log_policy = None
@@ -257,13 +284,18 @@ class Agent:
             
             # 优化&记录&梯度累计
             if (count+1)%int(BATCH_SIZE) == 0:
-                nn.utils.clip_grad_norm_(self.model.parameters(), MAX_NORM)
-                for name, param in self.model.named_parameters():
+                for name, param in self.value_model.named_parameters():
                     if param.grad is not None:
                         if torch.isnan(param.grad).any():
                             print(f'NaN gradient in {name}')
-                self.optimizer.step()
-                self.optimizer.zero_grad()
+                for name, param in self.policy_model.named_parameters():
+                    if param.grad is not None:
+                        if torch.isnan(param.grad).any():
+                            print(f'NaN gradient in {name}')
+                self.optimizer_policy.step()
+                self.optimizer_policy.zero_grad()
+                self.optimizer_value.step()
+                self.optimizer_value.zero_grad()
                 print(f"完成第{episode+1}轮{count+1}次权重更新")
             if (count+1)%int(BATCH_SIZE/NDISPLAY) == 0:
                 print(f"Loss:{loss}")
@@ -272,7 +304,8 @@ class Agent:
                 print(f"AVR Loss:{sum(display.losses)/len(display.losses)}\nAVR Value Loss:{sum(display.value_losses)/len(display.value_losses)}\nAVR Policy Loss:{sum(display.policy_losses)/len(display.policy_losses)}")
                 print(f"AVR Policy kl:{sum(kls)/len(kls)}")
         
-        self.model_old.load_state_dict(self.model.state_dict())
+        self.policy_model_old.load_state_dict(self.policy_model.state_dict())
+        self.value_model_old.load_state_dict(self.value_model.state_dict())
     
     def get_memory(self,call_back:Callable|None=None):
         done = False
@@ -327,10 +360,11 @@ class Agent:
             
             # 计算策略
             with torch.no_grad():
-                logits, _ = self.model_old(input_ids,no_value=True)
+                logits = self.policy_model_old(input_ids)
             # 压缩batch
-            logits = logits.squeeze(0)
+            logits = logits[:, -1, :]
             logits = logits.masked_fill(~tensor([True if item else False for item in action_mask],device=DEVICE),float('-inf'))# 去除无法使用的动作
+            logits = logits[0]
             policy = softmax(logits/ACTION_TEMPERATURE,0)# 转概率密度
             
             # Action(ε贪婪)，而且我们显然不希望采样到同样的轨迹训练
@@ -409,6 +443,7 @@ if __name__ == "__main__":
     agent = Agent()
     
     display = Display()
+    current_max = -100
     for episode in range(EPISODES):
         for index in range(MEMGET_NUM_PER_UPDATE):
             agent.get_memory(display.reward_update)
@@ -416,9 +451,17 @@ if __name__ == "__main__":
                 print(f"完成第{episode+1}轮{index+1}次轨迹收集\n平均奖励:{display.avr_reward:.4f}\n最大奖励:{display.max_reward:.4f}\n轨迹平均:{display.avr_reward_per_trail:.4f}\n轨迹最大:{display.max_reward_per_trail:.4f}")
         agent.update(agent.replay_buffer.sample(BATCH_SIZE*N_BATCH_SAMPLE),display.loss_update)
         print("Saving")
-        torch.save(agent.model_old.state_dict(), PATH)
-        with open(REPLAY_BUFFER_FILE,"wb") as file:
-            pickle.dump(agent.replay_buffer, file)
+        if not EVAL:
+            torch.save(agent.policy_model_old.state_dict(), f"{PATH}_policy.pt")
+            torch.save(agent.value_model_old.state_dict(), f"{PATH}_value.pt")
+            if display.avr_reward >= current_max:
+                torch.save(agent.policy_model_old.state_dict(), f"{PATH_MAX}_policy.pt")
+                torch.save(agent.value_model_old.state_dict(), f"{PATH_MAX}_value.pt")
+                current_max = display.avr_reward
+            with open(REPLAY_BUFFER_FILE,"wb") as file:
+                pickle.dump(agent.replay_buffer, file)
+        else:
+            sys.exit()
         print("Saved")
         display.reset()
         action_epsilion_scheduler.step()
