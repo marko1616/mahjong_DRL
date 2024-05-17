@@ -1,10 +1,5 @@
 import numpy as np
 
-import gymnasium as gym
-from gymnasium  import spaces
-from gymnasium.spaces import Space
-from gymnasium.spaces import Dict, Discrete, MultiDiscrete
-
 from random import shuffle
 from random import seed as random_seed
 
@@ -20,6 +15,8 @@ from typing import Optional
 from rich import print
 
 from copy import deepcopy
+
+RESET_SIGN = "RESET"
 
 """
 ## 动作空间定义
@@ -53,45 +50,14 @@ from copy import deepcopy
 """
 
 
-class MahjongHistoryIDS(Space):
-    """
-    存储麻将的历史数据。（Tokens形式）
-    标准格式f"{player: str}{action: str}"
-      - 备注:IDS顺序分别为按照如上操作的顺序构建每个人的动作空间然后按照0-1-2-3的顺序拼接，0为开局东家。
-    """
-
-    def __init__(self) -> None:
-        self.vocabulary_size = 184
-        super().__init__(dtype=np.int8, shape=None)  # None shape变长
-
-    def sample(self) -> None:
-        raise NotImplementedError(
-            "This space does not support random sampling.")
-
-    def contains(self, x) -> bool:
-        return True  # 别打出5个一样的牌乱七八糟的校验好烦啊
-
-    def __repr__(self) -> str:
-        return f"MahjongHistoryIDS"
-
-
-class MahjongEnv(gym.Env):
-    SCORE_WEIGHT: float = 0.01
+class MahjongEnv:
+    REWARD_WEIGHT_SHANTEN = 30
+    PENALTY_AVA_NUM: float = 1.2
+    SCORE_WEIGHT: float = 0.6
     REWARD_RICHI: float = 6
     NAME_MAP = {"m": "man", "p": "pin", "s": "sou", "z": "honors"}
 
     def __init__(self, is_three: bool = False):
-        super(MahjongEnv, self).__init__()
-        self.action_space = spaces.Discrete(22)
-        self.observation_space = Dict({
-            "tokens": MahjongHistoryIDS(),  # 使用我们的自定义空间
-            "is_three": Discrete(1),  # 0,1分别代表:(不是，是)三人麻将
-            "seat": Discrete(4),  # 0,1,2,3分别代表:(自风东南西北)
-            # 手牌数字按顺序分别代表:1-9m 1-9p 1-9s 1-7z(东南西北白发中)共34种
-            "hand": MultiDiscrete([34] * 14),
-        })
-        self.action_space = spaces.Discrete(184)  # 184种动作
-
         self.shanten_calculator = Shanten()
         self.score_calculator = HandCalculator()
         # self.reset(is_three=is_three)
@@ -127,7 +93,7 @@ class MahjongEnv(gym.Env):
         self.kang_count = 0  # 如果四次杠要流局除非能和
 
         self.status = {"richi": False,
-                       "shocking": False, "has_open_tanyao": False, "last_shanten": 6, "last_get_tile": "", "first_round": True}
+                       "shocking": False, "has_open_tanyao": False, "last_available_num": None, "last_shanten": 6, "last_get_tile": "", "first_round": True}
         # 根据游戏是三人还是四人，复制初始化的手牌结构
         self.hand_tiles = [deepcopy(self.hand_tiles) for _ in range(3)] if is_three else [
             deepcopy(self.hand_tiles) for _ in range(4)]
@@ -298,6 +264,25 @@ class MahjongEnv(gym.Env):
             return dora_list
         return TilesConverter.to_136_array(dora_list)
 
+    def _get_available_num(self, player_index: int) -> int:
+        tiles = self._get_hand_34_array(player_index)
+        now_shanten = self.shanten_calculator.calculate_shanten(tiles)
+        available_tiles = []
+        for index,num in enumerate(tiles):
+            if num > 0:
+                tiles_deleted = tiles.copy()
+                tiles_deleted[index] -=1
+                remain_tile_type = set(self.remain_tiles)
+                for get_tile in remain_tile_type:
+                    tiles_to_calcu = tiles_deleted.copy()
+                    tiles_to_calcu[self._str_to_34(get_tile).index(1)] += 1
+                    if self.shanten_calculator.calculate_shanten(tiles_to_calcu) < now_shanten:
+                        available_tiles.append(get_tile)
+        available_num = 0
+        for item in set(available_tiles):
+            available_num += self.remain_tiles.count(item)
+        return available_num
+
     def step(self, action: int, start: bool = False) -> tuple[dict, int, bool, list]:
         if not start:
             self.history_tokens.append(action)
@@ -349,10 +334,21 @@ class MahjongEnv(gym.Env):
         # 处理打牌
         if action < 35 and not start:
             # 计算本次摸入的牌有无导致向听数减小
+            shanten_change = False
             shanten = self.shanten_calculator.calculate_shanten(self._get_hand_34_array(self.seat_now))
-            if not self.status[self.seat_now]["first_round"] and shanten != self.status[self.seat_now]["last_shanten"]:
+            if not self.status[self.seat_now]["first_round"] and shanten != self.status[self.seat_now]["last_shanten"] and self.status[self.seat_now]["last_shanten"]:
                     reward_update = (reward_update + self.status[self.seat_now]["last_shanten"] - shanten) if shanten <= self.status[self.seat_now]["last_shanten"] else (reward_update + (self.status[self.seat_now]["last_shanten"] - shanten)*2)
+                    reward_update *= self.REWARD_WEIGHT_SHANTEN
+                    shanten_change = True
             self.status[self.seat_now]["last_shanten"] = shanten
+            self.status[self.seat_now]["first_round"] = False
+
+            available_num = self._get_available_num(self.seat_now)
+
+            if not self.status[self.seat_now]["first_round"] and available_num != self.status[self.seat_now]["last_available_num"] and not shanten_change and self.status[self.seat_now]["last_available_num"]:
+                    # 向听数变化时不计入有效进牌
+                    reward_update = (reward_update + self.status[self.seat_now]["last_available_num"] - available_num) if available_num <= self.status[self.seat_now]["last_available_num"] else (reward_update + (self.status[self.seat_now]["last_available_num"] - available_num)*self.PENALTY_AVA_NUM)
+            self.status[self.seat_now]["last_available_num"] = available_num
             self.status[self.seat_now]["first_round"] = False
             
             self.claiming_from = self.seat_now
@@ -501,6 +497,14 @@ class MahjongEnv(gym.Env):
     def close(self):
         pass
 
+def env_process(queue_in, queue_out):
+    env = MahjongEnv()
+    while True:
+        action = queue_in.get()
+        if action == RESET_SIGN:
+            queue_out.put(env.reset())
+        else:
+            queue_out.put(env.step(action))
 
 if __name__ == "__main__":
     # 测试
@@ -527,7 +531,7 @@ if __name__ == "__main__":
         status, reward, done, info = obj.step(random_one_index(info["action_mask"]))
         time_list.append(time.time()-time_s)
         # print(status["actions"])
-        print(reward,end=" ")
+        print(info["reward_update"],end=" ")
         if done:
             print(f"DONE #{seed}\nStep Time: {1/(sum(time_list)/len(time_list))} steps/second")
             status, reward, done, info = obj.reset()

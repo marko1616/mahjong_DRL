@@ -3,11 +3,14 @@ import sys
 import time
 import pickle
 import random
+import asyncio
 import datetime
-from dataclasses import dataclass, field
+import multiprocessing
 from typing import Callable
+from dataclasses import dataclass, field
+from concurrent.futures import ProcessPoolExecutor
 
-from env import MahjongEnv
+from env import env_process, RESET_SIGN
 from model import GPTModel
 from schedulers import Linear_scheduler
 
@@ -23,25 +26,26 @@ from torch import nn
 now = datetime.datetime.now()
 
 # 训练超参数
-MEMGET_NUM_PER_UPDATE = 20
+MEMGET_NUM_PER_UPDATE = 300
 REPLAY_BUFFER_SIZE = 2000
 EPOCHES_PER_UPDATE = 1
-ACTION_EPSILION = 0.2
+ACTION_EPSILION = 0.10
 MAX_UPDATE_KL = 1
 CLIP_EPSILION = 0.4
 WEIGHT_POLICY = 1
 WEIGHT_VALUE = 1.5
-N_BATCH_SAMPLE = 14
+N_BATCH_SAMPLE = 8
 BATCH_SIZE = 60
 EPISODES = 50
-BTEA = 2
-LR_VALUE = 8e-6
-LR_POLICY = 1e-5
+BTEA = 0.8
+LR_VALUE = 6e-6
+LR_POLICY = 2e-6
 action_epsilion_scheduler = Linear_scheduler(50,ACTION_EPSILION,0.0025)
 
 # 环境超参数
 ACTION_TEMPERATURE = 0.1
 STABLE_SEED_STEPS = 25# 保持种子在一定时间步内的稳定能增加拟合的可能?也更贴近少初始状态的RL。
+ENV_NUM = 10# 多进程
 
 # 目标超参数
 TARGET = "N_step_TD"
@@ -52,16 +56,16 @@ NTD = 4# TD自举步数
 alpha_scheduler = Linear_scheduler(50,ALPHA,0.10)
 
 # 模型超参数
-SEPARATION_LAYER_POLICY = 5
+SEPARATION_LAYER_POLICY = 6
 SEPARATION_LAYER_VALUE = 4
-DIM_FEEDFORWARD = 512
+DIM_FEEDFORWARD = 1024
 ENABLE_COMPILE = False
 PAD_TOKEN_ID = 219
 MAX_SEQ_LEN = 512
 ACTION_SIZE = 185
 VOCAB_SIZE = 1 + 184 + 34 + 1# [SEP]，action，手牌，[PAD]
 MAX_NORM = 0.5
-D_MODEL = 768# 内部feature维度
+D_MODEL = 1024# 内部feature维度
 DROPOUT = 0.1
 NHEAD = 8
 
@@ -81,6 +85,7 @@ if EVAL:
     ACTION_EPSILION = 0
     MEMGET_NUM_PER_UPDATE = 1000
     NDISPLAY = int(MEMGET_NUM_PER_UPDATE/2)
+    action_epsilion_scheduler = Linear_scheduler(50,0,0)
 
 @dataclass
 class Trail:
@@ -130,6 +135,7 @@ class Agent:
         self.optimizer_policy = optim.AdamW(self.policy_model.parameters(), lr=LR_POLICY)
         self.policy_model_old = GPTModel(config)
         self.policy_model_old.load_state_dict(self.policy_model.state_dict())
+        self.policy_model_old.eval()
 
         config.n_layer = SEPARATION_LAYER_VALUE
         config.out_size = 1
@@ -140,6 +146,7 @@ class Agent:
         self.optimizer_value = optim.AdamW(self.value_model.parameters(), lr=LR_VALUE)
         self.value_model_old = GPTModel(config)
         self.value_model_old.load_state_dict(self.value_model.state_dict())  
+        self.value_model_old.eval()
         
         self.MseLoss = nn.MSELoss()
         
@@ -148,7 +155,6 @@ class Agent:
                 self.replay_buffer = pickle.load(file)
         else:
             self.replay_buffer = ReplayBuffer()
-        self.env = MahjongEnv()
         
         self.policy_model.to(DEVICE,DTYPE)
         self.policy_model_old.to(DEVICE,DTYPE)
@@ -159,6 +165,17 @@ class Agent:
             self.policy_model_old = torch.compile(self.policy_model_old)
             self.value_model = torch.compile(self.value_model)
             self.value_model_old = torch.compile(self.value_model_old)
+        
+        # 我也不想写多进程啊，奈何单核CPU过慢
+        self.manager = multiprocessing.Manager()
+        self.out_queues = [self.manager.Queue() for _ in range(ENV_NUM)]
+        self.in_queues = [self.manager.Queue() for _ in range(ENV_NUM)]
+
+        self.executor = ProcessPoolExecutor()
+        for index in range(ENV_NUM):
+            self.executor.submit(env_process,queue_in=self.in_queues[index],queue_out=self.out_queues[index])
+
+        self.event_loop = asyncio.new_event_loop()
     
     def _get_GAEs(self, rewards, values) -> tensor:
         ending = torch.ones(len(rewards),device=DEVICE,dtype=DTYPE)
@@ -310,15 +327,18 @@ class Agent:
         
         self.policy_model_old.load_state_dict(self.policy_model.state_dict())
         self.value_model_old.load_state_dict(self.value_model.state_dict())
+        self.policy_model_old.eval()
+        self.value_model_old.eval()
     
-    def get_memory(self,call_back:Callable|None=None):
+    async def get_memory(self,process_id:int,call_back:Callable|None=None):
         done = False
         round = 0
         # 鉴于有四个智能体我们一次收集四分经验
         memories = [Trail() for _ in range(4)]
         random.seed(self.seed)
         self.seed_count += 1
-        state, reward, done, info = self.env.reset()
+        self.in_queues[process_id].put(RESET_SIGN)
+        state, reward, done, info = await self.event_loop.run_in_executor(None,self.out_queues[process_id].get)
         if self.seed_count >= STABLE_SEED_STEPS:
             self.seed_count = 0
             self.seed += 1
@@ -379,8 +399,9 @@ class Agent:
                 action = self._random_one_index(action_mask)
             
             memories[player_index].actions.append(action)
-                
-            state, reward, done, info = self.env.step(action)
+            
+            self.in_queues[process_id].put(action)
+            state, reward, done, info = await self.event_loop.run_in_executor(None,self.out_queues[process_id].get)
             round += 1
             
         if not call_back is None:
@@ -391,6 +412,12 @@ class Agent:
         for memory in memories:
             if memory:
                 self.replay_buffer.add(memory)
+    
+    def get_memory_batch(self,call_back:Callable|None=None):
+        tasks = []
+        for index in range(ENV_NUM):
+            tasks.append(self.event_loop.create_task(self.get_memory(index,call_back)))
+        self.event_loop.run_until_complete(asyncio.gather(*tasks))
 
 class Display:
     def __init__(self) -> None:
@@ -449,10 +476,9 @@ if __name__ == "__main__":
     display = Display()
     current_max = -100
     for episode in range(EPISODES):
-        for index in range(MEMGET_NUM_PER_UPDATE):
-            agent.get_memory(display.reward_update)
-            if (index+1) % int(MEMGET_NUM_PER_UPDATE/NDISPLAY) == 0:
-                print(f"完成第{episode+1}轮{index+1}次轨迹收集\n平均奖励:{display.avr_reward:.4f}\n最大奖励:{display.max_reward:.4f}\n轨迹平均:{display.avr_reward_per_trail:.4f}\n轨迹最大:{display.max_reward_per_trail:.4f}")
+        for index in range(int(MEMGET_NUM_PER_UPDATE/ENV_NUM)):
+            agent.get_memory_batch(display.reward_update)
+            print(f"完成第{episode+1}轮{(index+1)*ENV_NUM}次轨迹收集\n平均奖励:{display.avr_reward:.4f}\n最大奖励:{display.max_reward:.4f}\n轨迹平均:{display.avr_reward_per_trail:.4f}\n轨迹最大:{display.max_reward_per_trail:.4f}")
         agent.update(agent.replay_buffer.sample(BATCH_SIZE*N_BATCH_SAMPLE),display.loss_update)
         print("Saving")
         if not EVAL:
