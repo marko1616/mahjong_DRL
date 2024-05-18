@@ -1,16 +1,17 @@
 import os
 import sys
-import time
 import pickle
 import random
+import psutil
 import asyncio
 import datetime
 import multiprocessing
+from copy import deepcopy
 from typing import Callable
 from dataclasses import dataclass, field
 from concurrent.futures import ProcessPoolExecutor
 
-from env import env_process, RESET_SIGN
+from env import env_process, action_to_str, RESET_SIGN, STOP_SIGN
 from model import GPTModel
 from schedulers import Linear_scheduler
 
@@ -26,42 +27,43 @@ from torch import nn
 now = datetime.datetime.now()
 
 # 训练超参数
-MEMGET_NUM_PER_UPDATE = 300
-REPLAY_BUFFER_SIZE = 2000
+MEMGET_NUM_PER_UPDATE = 200
+REPLAY_BUFFER_SIZE = 1000
 EPOCHES_PER_UPDATE = 1
-ACTION_EPSILION = 0.10
+ACTION_EPSILION = 0.45
 MAX_UPDATE_KL = 1
 CLIP_EPSILION = 0.4
 WEIGHT_POLICY = 1
 WEIGHT_VALUE = 1.5
-N_BATCH_SAMPLE = 8
+N_BATCH_SAMPLE = 4
 BATCH_SIZE = 60
-EPISODES = 50
+EPISODES = 200
 BTEA = 0.8
-LR_VALUE = 6e-6
-LR_POLICY = 2e-6
-action_epsilion_scheduler = Linear_scheduler(50,ACTION_EPSILION,0.0025)
+LR_VALUE = 0.45e-6
+LR_POLICY = 0.5e-6
+action_epsilion_scheduler = Linear_scheduler(EPISODES,ACTION_EPSILION,0.0025)
 
 # 环境超参数
-ACTION_TEMPERATURE = 0.1
+ACTION_TEMPERATURE = 0.2
 STABLE_SEED_STEPS = 25# 保持种子在一定时间步内的稳定能增加拟合的可能?也更贴近少初始状态的RL。
-ENV_NUM = 10# 多进程
+ENV_NUM = 12# 多进程
 
 # 目标超参数
 TARGET = "N_step_TD"
-LAMBD = 0.10
+LAMBD = 0.4
 GAMMA = 0.99
-ALPHA = 0.65
-NTD = 4# TD自举步数
-alpha_scheduler = Linear_scheduler(50,ALPHA,0.10)
+ALPHA = 1
+NTD = 8# TD自举步数
+alpha_scheduler = Linear_scheduler(EPISODES,ALPHA,0.20)
+n_td_scheduler = Linear_scheduler(EPISODES,NTD,1)
 
 # 模型超参数
-SEPARATION_LAYER_POLICY = 6
+SEPARATION_LAYER_POLICY = 4
 SEPARATION_LAYER_VALUE = 4
 DIM_FEEDFORWARD = 1024
 ENABLE_COMPILE = False
 PAD_TOKEN_ID = 219
-MAX_SEQ_LEN = 512
+MAX_SEQ_LEN = 256
 ACTION_SIZE = 185
 VOCAB_SIZE = 1 + 184 + 34 + 1# [SEP]，action，手牌，[PAD]
 MAX_NORM = 0.5
@@ -79,13 +81,15 @@ DTYPE = torch.float
 PATH = "./mahjong"
 PATH_MAX = "./max"
 
-EVAL = False
+EVAL = True
 if EVAL:
     PATH = PATH_MAX
-    ACTION_EPSILION = 0
     MEMGET_NUM_PER_UPDATE = 1000
     NDISPLAY = int(MEMGET_NUM_PER_UPDATE/2)
-    action_epsilion_scheduler = Linear_scheduler(50,0,0)
+    action_epsilion_scheduler = Linear_scheduler(50,1,1)
+
+VERBOSE_FIRST = True
+first_collect = True
 
 @dataclass
 class Trail:
@@ -105,6 +109,7 @@ class ReplayBuffer:
 
     def sample(self, batch_size) -> tuple:
         sample_size = min(len(self.buffer), batch_size)
+        random.seed()# 回放采样还是随机一点吧
         samples = random.sample(self.buffer, sample_size)
         return samples
     
@@ -131,7 +136,7 @@ class Agent:
         self.policy_model = GPTModel(config)
         if os.path.exists(f"{PATH_MAX}_policy_max.pt"):
             self.policy_model.load_state_dict(torch.load(f"{PATH_MAX}_policy_max.pt"))
-            print("Loaded")
+            print("Policy model loaded")
         self.optimizer_policy = optim.AdamW(self.policy_model.parameters(), lr=LR_POLICY)
         self.policy_model_old = GPTModel(config)
         self.policy_model_old.load_state_dict(self.policy_model.state_dict())
@@ -142,7 +147,7 @@ class Agent:
         self.value_model = GPTModel(config)
         if os.path.exists(f"{PATH_MAX}_value_max.pt"):
             self.value_model.load_state_dict(torch.load(f"{PATH_MAX}_value_max.pt"))
-            print("Loaded")
+            print("Value model loaded")
         self.optimizer_value = optim.AdamW(self.value_model.parameters(), lr=LR_VALUE)
         self.value_model_old = GPTModel(config)
         self.value_model_old.load_state_dict(self.value_model.state_dict())  
@@ -153,6 +158,7 @@ class Agent:
         if os.path.exists(REPLAY_BUFFER_FILE):
             with open(REPLAY_BUFFER_FILE,"rb") as file:
                 self.replay_buffer = pickle.load(file)
+                print("Replay buffer loaded")
         else:
             self.replay_buffer = ReplayBuffer()
         
@@ -180,8 +186,8 @@ class Agent:
     def _get_GAEs(self, rewards, values) -> tensor:
         ending = torch.ones(len(rewards),device=DEVICE,dtype=DTYPE)
         ending[:-1] = 0
-        # 计算delta：即时奖励加上折扣后的下一状态值函数，减去当前状态值函数
         values = torch.cat((values, torch.zeros(1,device=DEVICE,dtype=DTYPE)), dim=0)# 终端后值函数设为0
+        # 计算delta：即时奖励加上折扣后的下一状态值函数，减去当前状态值函数
         deltas = rewards + self.gamma * values[1:] - values[:-1] * ending
         
         # 初始化GAE列表和累计优势
@@ -190,7 +196,7 @@ class Agent:
         
         # 逆向遍历deltas，计算GAE
         deltas.flip(0)
-        for index, delta in enumerate(deltas[:-1]):
+        for index, delta in enumerate(deltas):
             gae = delta + self.gamma * self.lambd * gae * ending[index]
             advs = gae if advs is None else torch.cat((advs,gae))
         advs.flip(0)
@@ -198,17 +204,18 @@ class Agent:
         return advs
 
     def _get_nTDs(self, rewards:tensor, values:tensor) -> tensor:
+        ntd_now = int(n_td_scheduler.get())
         trace_len = len(rewards)
 
         # 终端后值函数奖励设为0
-        values = torch.cat((values, torch.zeros(NTD,device=DEVICE,dtype=DTYPE)), dim=0)
-        rewards = torch.cat((rewards, torch.zeros(NTD,device=DEVICE,dtype=DTYPE)), dim=0)
+        values = torch.cat((values, torch.zeros(ntd_now,device=DEVICE,dtype=DTYPE)), dim=0)# 终端后值函数设为0
+        rewards = torch.cat((rewards, torch.zeros(ntd_now,device=DEVICE,dtype=DTYPE)), dim=0)
         
-        gammas = torch.pow(self.gamma, torch.arange(0, NTD, device=DEVICE,dtype=DTYPE))
+        gammas = torch.pow(self.gamma, torch.arange(0, ntd_now, device=DEVICE,dtype=DTYPE))
         
         nTDs = None
         for index in range(trace_len):
-            nTD = torch.sum(rewards[index:index+NTD-1]*gammas[:-1])+values[index+NTD]*gammas[-1]
+            nTD = torch.sum(rewards[index:index+ntd_now-1]*gammas[:-1])+values[index+ntd_now]*gammas[-1]
             nTD = nTD.unsqueeze(0)
 
             nTDs = nTD if nTDs is None else torch.cat((nTDs,nTD))
@@ -237,11 +244,13 @@ class Agent:
             
             # 获取需要的张量
             old_states = None
+            assert len(memory.states) - 1 == len(memory.rewards)
             for state in memory.states:
                 if old_states is None:
                     old_states = tensor(state,device=DEVICE).unsqueeze(0)
                 else:
                     old_states = torch.cat((old_states,tensor(state,device=DEVICE).unsqueeze(0)),dim=0)
+            old_states = old_states[:-1]
                     
             # 获取当前在线模型的动作对数概率
             logprobs = None
@@ -260,8 +269,8 @@ class Agent:
             # 优化
             # 获取目前模型的评估
             batch_logits = self.policy_model(old_states)[:,-1,:]
-            state_values = self.value_model(old_states)[:,-1,:]
-            state_values = state_values.squeeze(1)
+            state_values_old = self.value_model_old(old_states)[:,-1,:]
+            state_values_old = state_values_old.squeeze(1)
             
             batch_log_policy = None
             for index, logits in enumerate(batch_logits):
@@ -274,7 +283,7 @@ class Agent:
                 else:
                     batch_log_policy = torch.cat((batch_log_policy,policy[actions[index]].unsqueeze(0)))
             
-            advantages = self._get_GAEs(tensor(rewards,device=DEVICE,dtype=DTYPE), state_values).detach()
+            advantages = self._get_GAEs(tensor(rewards,device=DEVICE,dtype=DTYPE), state_values_old).detach()
             # 策略比例
             ratios = torch.exp(batch_log_policy-logprobs)
             kl = nn.functional.kl_div(logprobs,batch_log_policy,reduction='sum',log_target=True)
@@ -288,20 +297,22 @@ class Agent:
             # 策略裁剪(不使用是因为这似乎会导致梯度很容易无法传播)
             # cliped = torch.clamp(ratios, 1-self.eps_clip, 1+self.eps_clip)
             loss_policy = -ratios*advantages - self.beta*kl
+            loss_policy = loss_policy.mean()
             
             # 价值损失
+            state_values = self.value_model(old_states)[:,-1,:]
+            state_values = state_values.squeeze(1)
             loss_value = self.MseLoss(state_values,
                                       (state_values+(self._get_nTDs(tensor(rewards,device=DEVICE,dtype=DTYPE),state_values)-state_values)*self.alpha.step()).detach()
                                       )
-            loss_value = self.weight_value * loss_value
-            loss_policy = self.weight_policy * loss_policy
-            loss = loss_policy + loss_value
-            loss_policy = loss_policy.mean()
+            loss_value = self.weight_value * loss_value / int(BATCH_SIZE)#梯度累计正则化
+            loss_policy = self.weight_policy * loss_policy / int(BATCH_SIZE)#梯度累计正则化
+            loss_value.backward()
+            loss_policy.backward()
+            loss = (loss_value + loss_policy).detach()
             loss = loss.mean()
-            loss = loss/int(BATCH_SIZE)#梯度累计正则化
-            loss.backward()
             if not call_back is None:
-                call_back(loss.mean().item(),loss_value.mean().item(),loss_policy.mean().item())
+                call_back(loss.item(),loss_value.item(),loss_policy.item())
             
             # 优化&记录&梯度累计
             if (count+1)%int(BATCH_SIZE) == 0:
@@ -330,11 +341,22 @@ class Agent:
         self.policy_model_old.eval()
         self.value_model_old.eval()
     
+    def _get_pad_ids(self,hand,history):
+        # 构建输入
+        input_ids = []
+        # 转换成token编码索引从185-219
+        hand_tokens = []
+        for index, num in enumerate(hand):
+            hand_tokens += [185+index]*num
+        input_ids += hand_tokens + [0] + history
+        input_ids = self._pad_list_to_length(input_ids)
+        return input_ids
+
     async def get_memory(self,process_id:int,call_back:Callable|None=None):
         done = False
-        round = 0
+        current_round = 0
         # 鉴于有四个智能体我们一次收集四分经验
-        memories = [Trail() for _ in range(4)]
+        memories = [Trail([],[],[],[],[]) for _ in range(4)]
         random.seed(self.seed)
         self.seed_count += 1
         self.in_queues[process_id].put(RESET_SIGN)
@@ -349,38 +371,10 @@ class Agent:
             history = state["tokens"]
             hand = state["hand"]
             
-            # 构建输入
-            input_ids = []
-            # 转换成token编码索引从185-219
-            hand_tokens = []
-            for index, num in enumerate(hand):
-                hand_tokens += [185+index]*num
-            input_ids += hand_tokens + [0] + history
-            input_ids = self._pad_list_to_length(input_ids)
+            input_ids = self._get_pad_ids(hand,history)
             memories[player_index].states.append(input_ids)
             input_ids = tensor(input_ids,device=DEVICE)
             input_ids = input_ids.unsqueeze(0)# 添加batch
-            
-            # 添加轨迹
-            memories[player_index].rewards.append(reward)
-            memories[player_index].is_terminals.append(done)
-            memories[player_index].info.append(info)
-            # 更新向听奖励
-            if len(memories[player_index].rewards)>=2:
-                memories[player_index].rewards[-2] += info["reward_update"]
-            if done:
-                # 方便截断的填充
-                memories[player_index].actions.append(0)
-                if VERBOSE_POSITIVE_DONE_REWARD and reward > 5:
-                    print(f"终局回报{reward}")
-                # 为所有人添加终端状态
-                for index, memory in enumerate(memories):
-                    if memory.is_terminals:
-                        memory.is_terminals[-1] = True
-                    else:
-                        # 天胡情况处理
-                        no_memory_index.append(index)
-                break
             
             # 计算策略
             with torch.no_grad():
@@ -392,25 +386,46 @@ class Agent:
             policy = softmax(logits/ACTION_TEMPERATURE,0)# 转概率密度
             
             # Action(ε贪婪)，而且我们显然不希望采样到同样的轨迹训练
-            random.seed(time.time())
+            random.seed()
             if random.random() > action_epsilion_scheduler.get():
                 action = torch.multinomial(policy,1).item()
             else:
                 action = self._random_one_index(action_mask)
             
-            memories[player_index].actions.append(action)
-            
             self.in_queues[process_id].put(action)
             state, reward, done, info = await self.event_loop.run_in_executor(None,self.out_queues[process_id].get)
-            round += 1
+
+            # 添加轨迹
+            memories[player_index].is_terminals.append(False)
+            memories[player_index].info.append(info)
+            memories[player_index].actions.append(action)
+            memories[player_index].rewards.append(reward)
+            # 更新向听奖励
+            if len(memories[player_index].rewards)>=2:
+                memories[player_index].rewards[-2] += info["reward_update"]
+            if done:
+                # 方便截断的填充
+                if VERBOSE_POSITIVE_DONE_REWARD and reward > 5:
+                    print(f"终局回报{reward}")
+                # 为所有人添加终端状态
+                for index, memory in enumerate(memories):
+                    memory.states.append([PAD_TOKEN_ID]*MAX_SEQ_LEN)
+
+                    if memory.is_terminals:
+                        memory.is_terminals.append(True)
+                    else:
+                        # 天胡等有人打不了牌情况处理
+                        no_memory_index.append(index)
+                break
+            current_round += 1
             
         if not call_back is None:
             for index, memory in enumerate(memories):
                 if not index in no_memory_index:
                     call_back(memory.rewards)
         
-        for memory in memories:
-            if memory:
+        for index, memory in enumerate(memories):
+            if index not in no_memory_index:
                 self.replay_buffer.add(memory)
     
     def get_memory_batch(self,call_back:Callable|None=None):
@@ -467,31 +482,56 @@ class Display:
         self.max_reward = 0
         self.avr_reward_per_trail = 0
         self.max_reward_per_trail = 0
-             
+
+def kill_child_processes(parent_pid):
+    try:
+        parent = psutil.Process(parent_pid)
+    except psutil.NoSuchProcess:
+        # 找不到自己可还行
+        return
+    children = parent.children(recursive=True)
+    for process in children:
+        process.kill()
+
 if __name__ == "__main__":
-    from rich import print
-    
-    agent = Agent()
-    
-    display = Display()
-    current_max = -100
-    for episode in range(EPISODES):
-        for index in range(int(MEMGET_NUM_PER_UPDATE/ENV_NUM)):
-            agent.get_memory_batch(display.reward_update)
-            print(f"完成第{episode+1}轮{(index+1)*ENV_NUM}次轨迹收集\n平均奖励:{display.avr_reward:.4f}\n最大奖励:{display.max_reward:.4f}\n轨迹平均:{display.avr_reward_per_trail:.4f}\n轨迹最大:{display.max_reward_per_trail:.4f}")
-        agent.update(agent.replay_buffer.sample(BATCH_SIZE*N_BATCH_SAMPLE),display.loss_update)
-        print("Saving")
-        if not EVAL:
-            torch.save(agent.policy_model_old.state_dict(), f"{PATH}_policy.pt")
-            torch.save(agent.value_model_old.state_dict(), f"{PATH}_value.pt")
-            if display.avr_reward >= current_max:
-                torch.save(agent.policy_model_old.state_dict(), f"{PATH_MAX}_policy_max.pt")
-                torch.save(agent.value_model_old.state_dict(), f"{PATH_MAX}_value_max.pt")
-                current_max = display.avr_reward
-            with open(REPLAY_BUFFER_FILE,"wb") as file:
-                pickle.dump(agent.replay_buffer, file)
-        else:
-            sys.exit()
-        print("Saved")
-        display.reset()
-        action_epsilion_scheduler.step()
+    try:
+        from rich import print
+        agent = Agent()
+        display = Display()
+        current_max = -1000
+        for episode in range(EPISODES):
+            for index in range(int(MEMGET_NUM_PER_UPDATE/ENV_NUM)):
+                agent.get_memory_batch(display.reward_update)
+                print(f"完成第{episode+1}轮{(index+1)*ENV_NUM}次轨迹收集\n平均奖励:{display.avr_reward:.4f}\n最大奖励:{display.max_reward:.4f}\n轨迹平均:{display.avr_reward_per_trail:.4f}\n轨迹最大:{display.max_reward_per_trail:.4f}")
+
+                sample = agent.replay_buffer.sample(1)[0].actions
+                if VERBOSE_FIRST and first_collect:
+                    print("第一次收集的轨迹:")
+                    for action in sample:
+                            print(action_to_str(action))
+                first_collect = False
+
+            agent.update(agent.replay_buffer.sample(BATCH_SIZE*N_BATCH_SAMPLE),display.loss_update)
+            print("Saving")
+            if not EVAL:
+                torch.save(agent.policy_model_old.state_dict(), f"{PATH}_policy.pt")
+                torch.save(agent.value_model_old.state_dict(), f"{PATH}_value.pt")
+                if display.avr_reward_per_trail >= current_max:
+                    torch.save(agent.policy_model_old.state_dict(), f"{PATH_MAX}_policy_max.pt")
+                    torch.save(agent.value_model_old.state_dict(), f"{PATH_MAX}_value_max.pt")
+                    current_max = display.avr_reward_per_trail
+                with open(REPLAY_BUFFER_FILE,"wb") as file:
+                    pickle.dump(agent.replay_buffer, file)
+            else:
+                sys.exit()
+            print("Saved")
+            display.reset()
+            action_epsilion_scheduler.step()
+            n_td_scheduler.step()
+        # 多进程关闭
+        for queue in agent.in_queues:
+            queue.put(STOP_SIGN)
+    except (KeyboardInterrupt,SystemExit):
+        print("Exit")
+    finally:
+        kill_child_processes(os.getpid())

@@ -17,6 +17,7 @@ from rich import print
 from copy import deepcopy
 
 RESET_SIGN = "RESET"
+STOP_SIGN = "STOP"
 
 """
 ## 动作空间定义
@@ -51,10 +52,12 @@ RESET_SIGN = "RESET"
 
 
 class MahjongEnv:
-    REWARD_WEIGHT_SHANTEN = 30
+    REWARD_WEIGHT_SHANTEN: float = 30.
     PENALTY_AVA_NUM: float = 1.2
     SCORE_WEIGHT: float = 0.6
-    REWARD_RICHI: float = 6
+    REWARD_RICHI: float = 6.
+    REWARD_NO_YAKU: float = -100.
+    REWARD_OPEN_TANYAO: float = -10
     NAME_MAP = {"m": "man", "p": "pin", "s": "sou", "z": "honors"}
 
     def __init__(self, is_three: bool = False):
@@ -137,6 +140,13 @@ class MahjongEnv:
                     return self.pending_claiming[claiming_type][0]
         return False
 
+    def tile_34_to_str(card: int) -> str:
+        index_to_card_map = {0: "m", 1: "p", 2: "s"}
+        if card < 28:  # 非字牌
+            return f"{card-int((card-1)/9)*9}{index_to_card_map[int((card-1)/9)]}"
+        else:
+            return f"{card-27}z"
+
     def _34_to_str(self, card: int) -> str:
         index_to_card_map = {0: "m", 1: "p", 2: "s"}
         if card < 28:  # 非字牌
@@ -160,6 +170,7 @@ class MahjongEnv:
 
     def _handle_meld(self, action, claiming_event) -> None:
         # 移除别的鸣牌
+        reward = 0
         for key in {"kang", "pong", "chi"}:
             self.pending_claiming[key] = []
         # 杠
@@ -186,6 +197,7 @@ class MahjongEnv:
             else:
                 self.melds[self.seat_now].append(Meld(meld_type=Meld.KAN,tiles=temp_tiles))
                 self.status[self.seat_now]["has_open_tanyao"] = True
+                reward += self.REWARD_OPEN_TANYAO
                 self._delta_bucket(
                     self.hand_tiles[self.seat_now], self._34_to_str(claiming_event[2]+1), gain=-3)
             # 发岭上
@@ -199,12 +211,14 @@ class MahjongEnv:
             temp_tiles = TilesConverter.to_136_array(temp_tiles)
             self.melds[self.seat_now].append(Meld(meld_type=Meld.PON,tiles=temp_tiles))
             self.status[self.seat_now]["has_open_tanyao"] = True
+            reward += self.REWARD_OPEN_TANYAO
             self._delta_bucket(
                 self.hand_tiles[self.seat_now], self._34_to_str(claiming_event[2]+1), gain=-2)
 
         # 吃
         else:
             self.status[self.seat_now]["has_open_tanyao"] = True
+            reward += self.REWARD_OPEN_TANYAO
             if action == 37:
                 temp_tiles = [0]*34
                 temp_tiles[claiming_event[2]] += 1
@@ -238,6 +252,7 @@ class MahjongEnv:
                     self.hand_tiles[self.seat_now], self._34_to_str(claiming_event[2]+3), gain=-1)
                 self._delta_bucket(
                     self.hand_tiles[self.seat_now], self._34_to_str(claiming_event[2]+2), gain=-1)
+        return reward
 
     def _get_discard_mask(self, player_index) -> list[int]:
         if self.status[player_index]["richi"]:
@@ -327,7 +342,7 @@ class MahjongEnv:
             elif action in {35, 36, 37, 38, 39, 40, 41}:
                 # 处理吃、碰、各类杠
                 self._get_first_claiming_event(pop=True)
-                self._handle_meld(action, claiming_event)
+                reward += self._handle_meld(action, claiming_event)
 
                 claiming = True
 
@@ -370,9 +385,10 @@ class MahjongEnv:
                                                                 config=HandConfig(is_riichi=self.status[self.seat_now]["richi"],
                                                                                     options=OptionalRules(self.status[self.seat_now]["has_open_tanyao"])))
                     if not result.error:
-                        # 存在役等乱七八糟的error
-                        self.pending_claiming["ron"].append(
-                            [player_index, 44, result])
+                        # 不存在役等乱七八糟的error
+                        self.pending_claiming["ron"].append([player_index, 44, result])
+                    elif result.error == self.score_calculator.ERR_NO_YAKU:
+                        reward += self.REWARD_NO_YAKU
                 if not self.status[player_index]["richi"]:
                     if action <= 27 and (player_index - 1 == self.seat_now or (player_index == 0 and self.seat_now == 3)):# 不能吃字牌和只能吃上家
                         # 上吃
@@ -467,6 +483,8 @@ class MahjongEnv:
                     action_mask = self._add_action_list(action_mask, temp_list)
                 else:
                     action_mask = self._add_action_list(action_mask, self._get_discard_mask(self.seat_now))
+                    if result.error == self.score_calculator.ERR_NO_YAKU:
+                        reward += self.REWARD_NO_YAKU
             elif shanten == 0 and not self.melds[self.seat_now] and not self.status[self.seat_now]["richi"]:
                 # 如果可以立直
                 temp_list = [0]*46
@@ -501,10 +519,38 @@ def env_process(queue_in, queue_out):
     env = MahjongEnv()
     while True:
         action = queue_in.get()
+        if action == STOP_SIGN:
+            break
+
         if action == RESET_SIGN:
             queue_out.put(env.reset())
         else:
             queue_out.put(env.step(action))
+
+def action_to_str(action:int):
+    seat = int((action-1) / 46)
+    action = ((action-1) % 46)+1
+    if action in range(1,35):
+        return f"{seat}号玩家打出{MahjongEnv.tile_34_to_str(action)}"
+    elif action in range(35,38):
+        return f"{seat}号玩家吃牌"
+    elif action == 38:
+        return f"{seat}号玩家碰牌"
+    elif action in range(39, 41):
+        return f"{seat}号玩家杠牌"
+    elif action == 42:
+        return f"{seat}号玩家拔北"
+    elif action == 43:
+        return f"{seat}号玩家立直"
+    elif action == 44:
+        return f"{seat}号玩家荣和"
+    elif action == 45:
+        return f"{seat}号玩家自摸"
+    elif action == 46:
+        return f"{seat}号玩家跳过"
+    else:
+        # 不应该执行这个
+        assert False
 
 if __name__ == "__main__":
     # 测试
@@ -528,10 +574,11 @@ if __name__ == "__main__":
     status, reward, done, info = obj.reset()
     while True:
         time_s = time.time()
-        status, reward, done, info = obj.step(random_one_index(info["action_mask"]))
+        action = random_one_index(info["action_mask"])
+        status, reward, done, info = obj.step(action)
         time_list.append(time.time()-time_s)
         # print(status["actions"])
-        print(info["reward_update"],end=" ")
+        print(action_to_str(action),end=" ")
         if done:
             print(f"DONE #{seed}\nStep Time: {1/(sum(time_list)/len(time_list))} steps/second")
             status, reward, done, info = obj.reset()
