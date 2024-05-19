@@ -54,7 +54,7 @@ STOP_SIGN = "STOP"
 class MahjongEnv:
     REWARD_WEIGHT_SHANTEN: float = 30.
     PENALTY_AVA_NUM: float = 1.2
-    SCORE_WEIGHT: float = 0.6
+    SCORE_WEIGHT: float = 0.1
     REWARD_RICHI: float = 6.
     REWARD_NO_YAKU: float = -100.
     REWARD_OPEN_TANYAO: float = -10

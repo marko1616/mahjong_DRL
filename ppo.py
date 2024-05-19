@@ -27,43 +27,44 @@ from torch import nn
 now = datetime.datetime.now()
 
 # 训练超参数
-MEMGET_NUM_PER_UPDATE = 200
+MEMGET_NUM_PER_UPDATE = 600
 REPLAY_BUFFER_SIZE = 1000
 EPOCHES_PER_UPDATE = 1
-ACTION_EPSILION = 0.45
+ACTION_EPSILION = 0.6
 MAX_UPDATE_KL = 1
 CLIP_EPSILION = 0.4
 WEIGHT_POLICY = 1
 WEIGHT_VALUE = 1.5
-N_BATCH_SAMPLE = 4
-BATCH_SIZE = 60
-EPISODES = 200
-BTEA = 0.8
-LR_VALUE = 0.45e-6
-LR_POLICY = 0.5e-6
-action_epsilion_scheduler = Linear_scheduler(EPISODES,ACTION_EPSILION,0.0025)
+N_BATCH_SAMPLE = 7
+BATCH_SIZE = 100
+EPISODES = 100
+BTEA = 0.2
+LR_VALUE = 4e-6
+LR_POLICY = 4e-6
+action_epsilion_scheduler = Linear_scheduler(EPISODES,ACTION_EPSILION,0.08)
 
 # 环境超参数
 ACTION_TEMPERATURE = 0.2
 STABLE_SEED_STEPS = 25# 保持种子在一定时间步内的稳定能增加拟合的可能?也更贴近少初始状态的RL。
-ENV_NUM = 12# 多进程
+INIT_ENV_SEED = 12521
+ENV_NUM = 16# 多进程
 
 # 目标超参数
 TARGET = "N_step_TD"
-LAMBD = 0.4
-GAMMA = 0.99
+LAMBD = 0.1
+GAMMA = 0.25
 ALPHA = 1
-NTD = 8# TD自举步数
+NTD = 3# TD自举步数
 alpha_scheduler = Linear_scheduler(EPISODES,ALPHA,0.20)
 n_td_scheduler = Linear_scheduler(EPISODES,NTD,1)
 
 # 模型超参数
-SEPARATION_LAYER_POLICY = 4
+SEPARATION_LAYER_POLICY = 8
 SEPARATION_LAYER_VALUE = 4
 DIM_FEEDFORWARD = 1024
 ENABLE_COMPILE = False
 PAD_TOKEN_ID = 219
-MAX_SEQ_LEN = 256
+MAX_SEQ_LEN = 128
 ACTION_SIZE = 185
 VOCAB_SIZE = 1 + 184 + 34 + 1# [SEP]，action，手牌，[PAD]
 MAX_NORM = 0.5
@@ -79,14 +80,17 @@ LOG_DIR = f"runs/{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
 DEVICE = "cuda"
 DTYPE = torch.float
 PATH = "./mahjong"
+TOP_K = None
 PATH_MAX = "./max"
 
-EVAL = True
+EVAL = False
 if EVAL:
+    TOP_K = 2
     PATH = PATH_MAX
     MEMGET_NUM_PER_UPDATE = 1000
+    ACTION_TEMPERATURE = 0.1
     NDISPLAY = int(MEMGET_NUM_PER_UPDATE/2)
-    action_epsilion_scheduler = Linear_scheduler(50,1,1)
+    action_epsilion_scheduler = Linear_scheduler(50,0,0)
 
 VERBOSE_FIRST = True
 first_collect = True
@@ -123,8 +127,9 @@ class Agent:
         self.alpha = alpha
         self.beta = beta
         self.lambd = lambd
-        self.seed = 0
+        self.seed = INIT_ENV_SEED
         self.seed_count = 0
+        self.max_trail_len = 0
         
         config = GPTModel.get_default_config()
         config.n_layer = SEPARATION_LAYER_POLICY
@@ -134,8 +139,8 @@ class Agent:
         config.out_size = 185
         config.block_size = 512
         self.policy_model = GPTModel(config)
-        if os.path.exists(f"{PATH_MAX}_policy_max.pt"):
-            self.policy_model.load_state_dict(torch.load(f"{PATH_MAX}_policy_max.pt"))
+        if os.path.exists(f"{PATH}_policy.pt"):
+            self.policy_model.load_state_dict(torch.load(f"{PATH_MAX}_policy.pt"))
             print("Policy model loaded")
         self.optimizer_policy = optim.AdamW(self.policy_model.parameters(), lr=LR_POLICY)
         self.policy_model_old = GPTModel(config)
@@ -145,8 +150,8 @@ class Agent:
         config.n_layer = SEPARATION_LAYER_VALUE
         config.out_size = 1
         self.value_model = GPTModel(config)
-        if os.path.exists(f"{PATH_MAX}_value_max.pt"):
-            self.value_model.load_state_dict(torch.load(f"{PATH_MAX}_value_max.pt"))
+        if os.path.exists(f"{PATH}_value.pt"):
+            self.value_model.load_state_dict(torch.load(f"{PATH_MAX}_value.pt"))
             print("Value model loaded")
         self.optimizer_value = optim.AdamW(self.value_model.parameters(), lr=LR_VALUE)
         self.value_model_old = GPTModel(config)
@@ -426,6 +431,9 @@ class Agent:
         
         for index, memory in enumerate(memories):
             if index not in no_memory_index:
+                if len(memory.states) > self.max_trail_len:
+                    print(f"Max trail len up to {len(memory.states)}")
+                    self.max_trail_len = len(memory.states)
                 self.replay_buffer.add(memory)
     
     def get_memory_batch(self,call_back:Callable|None=None):
@@ -517,8 +525,8 @@ if __name__ == "__main__":
                 torch.save(agent.policy_model_old.state_dict(), f"{PATH}_policy.pt")
                 torch.save(agent.value_model_old.state_dict(), f"{PATH}_value.pt")
                 if display.avr_reward_per_trail >= current_max:
-                    torch.save(agent.policy_model_old.state_dict(), f"{PATH_MAX}_policy_max.pt")
-                    torch.save(agent.value_model_old.state_dict(), f"{PATH_MAX}_value_max.pt")
+                    torch.save(agent.policy_model_old.state_dict(), f"{PATH_MAX}_policy.pt")
+                    torch.save(agent.value_model_old.state_dict(), f"{PATH_MAX}_value.pt")
                     current_max = display.avr_reward_per_trail
                 with open(REPLAY_BUFFER_FILE,"wb") as file:
                     pickle.dump(agent.replay_buffer, file)
@@ -531,6 +539,7 @@ if __name__ == "__main__":
         # 多进程关闭
         for queue in agent.in_queues:
             queue.put(STOP_SIGN)
+        kill_child_processes(os.getpid())
     except (KeyboardInterrupt,SystemExit):
         print("Exit")
     finally:
