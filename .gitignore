@@ -160,7 +160,10 @@ cython_debug/
 .idea/
 
 # custom .gitignore
-user.config
+.ruff_cache/
 saves/
 cache/
 runs/
+
+*.pt
+*.pkl

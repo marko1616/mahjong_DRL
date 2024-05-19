@@ -1,4 +1,3 @@
-import numpy as np
 
 from random import shuffle
 from random import seed as random_seed

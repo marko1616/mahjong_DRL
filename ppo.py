@@ -6,7 +6,6 @@ import psutil
 import asyncio
 import datetime
 import multiprocessing
-from copy import deepcopy
 from typing import Callable
 from dataclasses import dataclass, field
 from concurrent.futures import ProcessPoolExecutor
@@ -37,7 +36,7 @@ WEIGHT_POLICY = 1
 WEIGHT_VALUE = 1.5
 N_BATCH_SAMPLE = 7
 BATCH_SIZE = 100
-EPISODES = 100
+EPISODES = 200
 BTEA = 0.2
 LR_VALUE = 4e-6
 LR_POLICY = 4e-6
@@ -45,14 +44,14 @@ action_epsilion_scheduler = Linear_scheduler(EPISODES,ACTION_EPSILION,0.08)
 
 # 环境超参数
 ACTION_TEMPERATURE = 0.2
-STABLE_SEED_STEPS = 25# 保持种子在一定时间步内的稳定能增加拟合的可能?也更贴近少初始状态的RL。
-INIT_ENV_SEED = 12521
+STABLE_SEED_STEPS = 15# 保持种子在一定时间步内的稳定能增加拟合的可能?也更贴近少初始状态的RL。
+INIT_ENV_SEED = 1616
 ENV_NUM = 16# 多进程
 
 # 目标超参数
 TARGET = "N_step_TD"
 LAMBD = 0.1
-GAMMA = 0.25
+GAMMA = 0.20
 ALPHA = 1
 NTD = 3# TD自举步数
 alpha_scheduler = Linear_scheduler(EPISODES,ALPHA,0.20)
@@ -316,7 +315,7 @@ class Agent:
             loss_policy.backward()
             loss = (loss_value + loss_policy).detach()
             loss = loss.mean()
-            if not call_back is None:
+            if call_back is not None:
                 call_back(loss.item(),loss_value.item(),loss_policy.item())
             
             # 优化&记录&梯度累计
@@ -362,7 +361,10 @@ class Agent:
         current_round = 0
         # 鉴于有四个智能体我们一次收集四分经验
         memories = [Trail([],[],[],[],[]) for _ in range(4)]
-        random.seed(self.seed)
+        if not EVAL:
+            random.seed(self.seed)
+        else:
+            random.seed()
         self.seed_count += 1
         self.in_queues[process_id].put(RESET_SIGN)
         state, reward, done, info = await self.event_loop.run_in_executor(None,self.out_queues[process_id].get)
@@ -424,9 +426,9 @@ class Agent:
                 break
             current_round += 1
             
-        if not call_back is None:
+        if call_back is not None:
             for index, memory in enumerate(memories):
-                if not index in no_memory_index:
+                if index not in no_memory_index:
                     call_back(memory.rewards)
         
         for index, memory in enumerate(memories):
