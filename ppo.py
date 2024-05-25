@@ -1,5 +1,6 @@
 import os
 import sys
+import time
 import pickle
 import random
 import psutil
@@ -11,10 +12,14 @@ from dataclasses import dataclass, field
 from concurrent.futures import ProcessPoolExecutor
 
 from env import env_process, action_to_str, RESET_SIGN, STOP_SIGN
-from model import GPTModel
-from schedulers import Linear_scheduler
+from model import set_seeds, GPTModel
+from infer import infer_engine, SIGN_UPDATE, SIGN_UPDATED
+from config import *
 
 from collections import deque
+
+from rich import print
+from rich.console import Console
 
 import torch
 from torch.nn.functional import softmax
@@ -22,77 +27,6 @@ from torch.utils.tensorboard import SummaryWriter
 from torch import tensor
 from torch import optim
 from torch import nn
-
-now = datetime.datetime.now()
-
-# 训练超参数
-MEMGET_NUM_PER_UPDATE = 600
-REPLAY_BUFFER_SIZE = 1000
-EPOCHES_PER_UPDATE = 1
-ACTION_EPSILION = 0.6
-MAX_UPDATE_KL = 1
-CLIP_EPSILION = 0.4
-WEIGHT_POLICY = 1
-WEIGHT_VALUE = 1.5
-N_BATCH_SAMPLE = 7
-BATCH_SIZE = 100
-EPISODES = 200
-BTEA = 0.2
-LR_VALUE = 4e-6
-LR_POLICY = 4e-6
-action_epsilion_scheduler = Linear_scheduler(EPISODES,ACTION_EPSILION,0.08)
-
-# 环境超参数
-ACTION_TEMPERATURE = 0.2
-STABLE_SEED_STEPS = 15# 保持种子在一定时间步内的稳定能增加拟合的可能?也更贴近少初始状态的RL。
-INIT_ENV_SEED = 1616
-ENV_NUM = 16# 多进程
-
-# 目标超参数
-TARGET = "N_step_TD"
-LAMBD = 0.1
-GAMMA = 0.20
-ALPHA = 1
-NTD = 3# TD自举步数
-alpha_scheduler = Linear_scheduler(EPISODES,ALPHA,0.20)
-n_td_scheduler = Linear_scheduler(EPISODES,NTD,1)
-
-# 模型超参数
-SEPARATION_LAYER_POLICY = 8
-SEPARATION_LAYER_VALUE = 4
-DIM_FEEDFORWARD = 1024
-ENABLE_COMPILE = False
-PAD_TOKEN_ID = 219
-MAX_SEQ_LEN = 128
-ACTION_SIZE = 185
-VOCAB_SIZE = 1 + 184 + 34 + 1# [SEP]，action，手牌，[PAD]
-MAX_NORM = 0.5
-D_MODEL = 1024# 内部feature维度
-DROPOUT = 0.1
-NHEAD = 8
-
-# 计算参数&保存参数&显示参数
-VERBOSE_POSITIVE_DONE_REWARD = True
-REPLAY_BUFFER_FILE = "replay.pkl"
-NDISPLAY = 10
-LOG_DIR = f"runs/{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}"
-DEVICE = "cuda"
-DTYPE = torch.float
-PATH = "./mahjong"
-TOP_K = None
-PATH_MAX = "./max"
-
-EVAL = False
-if EVAL:
-    TOP_K = 2
-    PATH = PATH_MAX
-    MEMGET_NUM_PER_UPDATE = 1000
-    ACTION_TEMPERATURE = 0.1
-    NDISPLAY = int(MEMGET_NUM_PER_UPDATE/2)
-    action_epsilion_scheduler = Linear_scheduler(50,0,0)
-
-VERBOSE_FIRST = True
-first_collect = True
 
 @dataclass
 class Trail:
@@ -112,7 +46,7 @@ class ReplayBuffer:
 
     def sample(self, batch_size) -> tuple:
         sample_size = min(len(self.buffer), batch_size)
-        random.seed()# 回放采样还是随机一点吧
+        set_seeds()# 回放采样还是随机一点吧
         samples = random.sample(self.buffer, sample_size)
         return samples
     
@@ -145,15 +79,28 @@ class Agent:
         self.policy_model_old = GPTModel(config)
         self.policy_model_old.load_state_dict(self.policy_model.state_dict())
         self.policy_model_old.eval()
+        # 推理阶段允许多卡并行
+        self.infer_manager = multiprocessing.Manager()
+        self.infer_ids_in_queue = self.infer_manager.Queue()
+        self.infer_in_queues = [self.infer_manager.Queue() for _ in range(len(INFER_DEVICES))]
+        self.infer_out_queues = [self.infer_manager.Queue() for _ in range(len(INFER_DEVICES))]
+        self.infer_executor = ProcessPoolExecutor()
+        for index, device in enumerate(INFER_DEVICES):
+            self.infer_executor.submit(infer_engine,queue_in=self.infer_in_queues[index],queue_out=self.infer_out_queues[index],ids_in=self.infer_ids_in_queue,config=config,device=device)
 
+        config = GPTModel.get_default_config()
         config.n_layer = SEPARATION_LAYER_VALUE
+        config.n_head = NHEAD
+        config.n_embd = D_MODEL
+        config.vocab_size = VOCAB_SIZE
         config.out_size = 1
+        config.block_size = 512
         self.value_model = GPTModel(config)
         if os.path.exists(f"{PATH}_value.pt"):
             self.value_model.load_state_dict(torch.load(f"{PATH_MAX}_value.pt"))
             print("Value model loaded")
         self.optimizer_value = optim.AdamW(self.value_model.parameters(), lr=LR_VALUE)
-        self.value_model_old = GPTModel(config)
+        self.value_model_old = GPTModel(config  )
         self.value_model_old.load_state_dict(self.value_model.state_dict())  
         self.value_model_old.eval()
         
@@ -176,16 +123,18 @@ class Agent:
             self.value_model = torch.compile(self.value_model)
             self.value_model_old = torch.compile(self.value_model_old)
         
-        # 我也不想写多进程啊，奈何单核CPU过慢
-        self.manager = multiprocessing.Manager()
-        self.out_queues = [self.manager.Queue() for _ in range(ENV_NUM)]
-        self.in_queues = [self.manager.Queue() for _ in range(ENV_NUM)]
-
-        self.executor = ProcessPoolExecutor()
+        # 我也不想写多进程啊，奈何单核CPU过慢，显卡还不能吃满
+        self.env_manager = multiprocessing.Manager()
+        self.env_out_queues = [self.env_manager.Queue() for _ in range(ENV_NUM)]
+        self.env_in_queues = [self.env_manager.Queue() for _ in range(ENV_NUM)]
+        self.env_executor = ProcessPoolExecutor()
         for index in range(ENV_NUM):
-            self.executor.submit(env_process,queue_in=self.in_queues[index],queue_out=self.out_queues[index])
-
+            self.env_executor.submit(env_process,queue_in=self.env_in_queues[index],queue_out=self.env_out_queues[index])
+        
         self.event_loop = asyncio.new_event_loop()
+        # 只能同时有一个任务占用环境进程
+        self.conditions = [asyncio.Condition() for _ in range(ENV_NUM)]
+        self.env_lock = [0]*ENV_NUM
     
     def _get_GAEs(self, rewards, values) -> tensor:
         ending = torch.ones(len(rewards),device=DEVICE,dtype=DTYPE)
@@ -345,7 +294,7 @@ class Agent:
         self.policy_model_old.eval()
         self.value_model_old.eval()
     
-    def _get_pad_ids(self,hand,history):
+    def _get_pad_ids(self,hand,history) -> list:
         # 构建输入
         input_ids = []
         # 转换成token编码索引从185-219
@@ -356,22 +305,28 @@ class Agent:
         input_ids = self._pad_list_to_length(input_ids)
         return input_ids
 
-    async def get_memory(self,process_id:int,call_back:Callable|None=None):
+    async def get_memory(self,process_id:int,call_back:Callable|None=None) -> None:
+        # 环境锁
+        env_id = process_id % ENV_NUM
+        async with self.conditions[env_id]:
+            await self.conditions[env_id].wait_for(lambda: self.env_lock[env_id] == int(process_id/ENV_NUM))
+
         done = False
         current_round = 0
         # 鉴于有四个智能体我们一次收集四分经验
         memories = [Trail([],[],[],[],[]) for _ in range(4)]
         if not EVAL:
-            random.seed(self.seed)
+            set_seeds(self.seed)
         else:
-            random.seed()
+            set_seeds()
         self.seed_count += 1
-        self.in_queues[process_id].put(RESET_SIGN)
-        state, reward, done, info = await self.event_loop.run_in_executor(None,self.out_queues[process_id].get)
+        self.env_in_queues[env_id].put(RESET_SIGN)
+        state, reward, done, info = await self.event_loop.run_in_executor(None,self.env_out_queues[env_id].get)
         if self.seed_count >= STABLE_SEED_STEPS:
             self.seed_count = 0
             self.seed += 1
         no_memory_index = []
+        result_get_queue = self.infer_manager.Queue()
         while True:
             action_mask = info["action_mask"]
             player_index = state["seat"]
@@ -380,27 +335,18 @@ class Agent:
             
             input_ids = self._get_pad_ids(hand,history)
             memories[player_index].states.append(input_ids)
-            input_ids = tensor(input_ids,device=DEVICE)
-            input_ids = input_ids.unsqueeze(0)# 添加batch
-            
-            # 计算策略
-            with torch.no_grad():
-                logits = self.policy_model_old(input_ids)
-            # 压缩batch
-            logits = logits[:, -1, :]
-            logits = logits.masked_fill(~tensor([True if item else False for item in action_mask],device=DEVICE),float('-inf'))# 去除无法使用的动作
-            logits = logits[0]
-            policy = softmax(logits/ACTION_TEMPERATURE,0)# 转概率密度
             
             # Action(ε贪婪)，而且我们显然不希望采样到同样的轨迹训练
-            random.seed()
+            set_seeds()
             if random.random() > action_epsilion_scheduler.get():
-                action = torch.multinomial(policy,1).item()
+                # 不需要计算如果没被选择使用策略的话
+                self.infer_ids_in_queue.put((result_get_queue,input_ids,action_mask))
+                action = await self.event_loop.run_in_executor(None,result_get_queue.get)
             else:
                 action = self._random_one_index(action_mask)
-            
-            self.in_queues[process_id].put(action)
-            state, reward, done, info = await self.event_loop.run_in_executor(None,self.out_queues[process_id].get)
+
+            self.env_in_queues[env_id].put(action)
+            state, reward, done, info = await self.event_loop.run_in_executor(None,self.env_out_queues[env_id].get)
 
             # 添加轨迹
             memories[player_index].is_terminals.append(False)
@@ -437,10 +383,15 @@ class Agent:
                     print(f"Max trail len up to {len(memory.states)}")
                     self.max_trail_len = len(memory.states)
                 self.replay_buffer.add(memory)
+
+        # 释放环境给队列的下一个任务
+        async with self.conditions[env_id]:
+            self.env_lock[env_id] += 1
+            self.conditions[env_id].notify_all()
     
-    def get_memory_batch(self,call_back:Callable|None=None):
+    def get_memory_batch(self,call_back:Callable|None=None) -> None:
         tasks = []
-        for index in range(ENV_NUM):
+        for index in range(int(MEMGET_NUM_PER_UPDATE/4)):
             tasks.append(self.event_loop.create_task(self.get_memory(index,call_back)))
         self.event_loop.run_until_complete(asyncio.gather(*tasks))
 
@@ -456,6 +407,7 @@ class Display:
         self.max_reward = 0
         self.avr_reward_per_trail = 0
         self.max_reward_per_trail = 0
+        self.reward_update_time = 0
         
         self.step = 0
         self.writer = SummaryWriter(LOG_DIR)
@@ -463,11 +415,15 @@ class Display:
         for reward in reward_trail:
             self.rewards.append(reward)
         self.trail_rewards.append(sum(reward_trail))
+        self.reward_update_time += 1
         
         self.avr_reward = sum(self.rewards)/len(self.rewards)
         self.max_reward = max(self.rewards)
         self.avr_reward_per_trail = sum(self.trail_rewards)/len(self.trail_rewards)
         self.max_reward_per_trail = max(self.trail_rewards)
+
+        if self.reward_update_time % int(MEMGET_NUM_PER_UPDATE/NDISPLAY) == 0:
+            print(f"完成第{self.step+1}轮{self.reward_update_time}次轨迹收集\n平均奖励:{self.avr_reward:.4f}\n最大奖励:{self.max_reward:.4f}\n轨迹平均:{self.avr_reward_per_trail:.4f}\n轨迹最大:{self.max_reward_per_trail:.4f}")
     
     def loss_update(self, loss:float, value_loss:float, policy_loss:float) -> None:
         self.losses.append(loss)
@@ -492,6 +448,7 @@ class Display:
         self.max_reward = 0
         self.avr_reward_per_trail = 0
         self.max_reward_per_trail = 0
+        self.reward_update_time = 0
 
 def kill_child_processes(parent_pid):
     try:
@@ -504,26 +461,32 @@ def kill_child_processes(parent_pid):
         process.kill()
 
 if __name__ == "__main__":
+    if sys.platform.startswith('linux'):
+        # 无法使用fork(说实话创建一堆进程各个占用几个GB的内存还真挺抽象的)
+        multiprocessing.set_start_method("spawn")
+    now = datetime.datetime.now()
+    time_start = time.time()
+    assert MEMGET_NUM_PER_UPDATE % 4 == 0
     try:
-        from rich import print
         agent = Agent()
         display = Display()
         current_max = -1000
         for episode in range(EPISODES):
-            for index in range(int(MEMGET_NUM_PER_UPDATE/ENV_NUM)):
-                agent.get_memory_batch(display.reward_update)
-                print(f"完成第{episode+1}轮{(index+1)*ENV_NUM}次轨迹收集\n平均奖励:{display.avr_reward:.4f}\n最大奖励:{display.max_reward:.4f}\n轨迹平均:{display.avr_reward_per_trail:.4f}\n轨迹最大:{display.max_reward_per_trail:.4f}")
+            for queue_in in agent.infer_in_queues:
+                queue_in.put(SIGN_UPDATE)
+            for queue_out in agent.infer_out_queues:
+                assert queue_out.get() == SIGN_UPDATED
+            agent.get_memory_batch(display.reward_update)
 
-                sample = agent.replay_buffer.sample(1)[0].actions
-                if VERBOSE_FIRST and first_collect:
-                    print("第一次收集的轨迹:")
-                    for action in sample:
-                            print(action_to_str(action))
+            sample = agent.replay_buffer.sample(1)[0].actions
+            if VERBOSE_FIRST and first_collect:
+                print("第一次收集的轨迹:")
+                for action in sample:
+                        print(action_to_str(action))
                 first_collect = False
-
-            agent.update(agent.replay_buffer.sample(BATCH_SIZE*N_BATCH_SAMPLE),display.loss_update)
-            print("Saving")
             if not EVAL:
+                agent.update(agent.replay_buffer.sample(BATCH_SIZE*N_BATCH_SAMPLE),display.loss_update)
+                print("Saving")
                 torch.save(agent.policy_model_old.state_dict(), f"{PATH}_policy.pt")
                 torch.save(agent.value_model_old.state_dict(), f"{PATH}_value.pt")
                 if display.avr_reward_per_trail >= current_max:
@@ -536,13 +499,18 @@ if __name__ == "__main__":
                 sys.exit()
             print("Saved")
             display.reset()
+            # 锁是要复位的呢，很难绷忘了一次。
+            agent.env_lock = [0]*ENV_NUM
             action_epsilion_scheduler.step()
             n_td_scheduler.step()
         # 多进程关闭
-        for queue in agent.in_queues:
+        for queue in agent.env_in_queues:
             queue.put(STOP_SIGN)
         kill_child_processes(os.getpid())
     except (KeyboardInterrupt,SystemExit):
         print("Exit")
+    except BaseException:
+        Console.print_exception(show_locals=True)
     finally:
         kill_child_processes(os.getpid())
+    print(f"Time Usage: {(time.time()-time_start):.4f}")

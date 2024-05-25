@@ -1,6 +1,4 @@
 import os
-import sys
-import json
 import math
 import random
 
@@ -10,23 +8,14 @@ import torch.nn as nn
 from torch.nn import functional as F
 
 # miniGPT的部分代码
-def set_seed(seed):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-def setup_logging(config):
-    """ monotonous bookkeeping """
-    work_dir = config.system.work_dir
-    # create the work directory if it doesn't already exist
-    os.makedirs(work_dir, exist_ok=True)
-    # log the args (if any)
-    with open(os.path.join(work_dir, 'args.txt'), 'w') as f:
-        f.write(' '.join(sys.argv))
-    # log the config itself
-    with open(os.path.join(work_dir, 'config.json'), 'w') as f:
-        f.write(json.dumps(config.to_dict(), indent=4))
+def set_seeds(seed: int|None=None) -> None:
+  # 可能不应该封装在这里但也不行开utiles
+  if seed is None:
+      seed = sum([int(os.urandom(1)[0]) for _ in range(os.urandom(1)[0])])
+  random.seed(seed)
+  np.random.seed(seed)
+  torch.manual_seed(seed)
+  torch.cuda.manual_seed(seed)
 
 class CfgNode:
     """ a lightweight configuration class inspired by yacs """
@@ -180,8 +169,8 @@ class GPTModel(nn.Module):
                 torch.nn.init.normal_(p, mean=0.0, std=0.02/math.sqrt(2 * config.n_layer))
 
         # report number of parameters (note we don't count the decoder parameters in lm_head)
-        n_params = sum(p.numel() for p in self.transformer.parameters())
-        print("number of parameters: %.2fM" % (n_params/1e6,))
+        # n_params = sum(p.numel() for p in self.transformer.parameters())
+        # print("number of parameters: %.2fM" % (n_params/1e6,))
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
